@@ -1,0 +1,24 @@
+{
+ "name": "Example: HisClima logbook tables",
+ "prefill": "full",
+ "sources": [
+  "opus-5-5",
+  "hisclima-gt"
+ ],
+ "special_chars": [
+  "\"",
+  "½",
+  "¼",
+  "¾",
+  "°",
+  "′",
+  "″",
+  "—",
+  "·",
+  "†"
+ ],
+ "boxes": "optional",
+ "box_prefill": "model",
+ "box_formats": {},
+ "annotators": []
+}

@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Correct table structure, cell text and cell boxes against the image, in the browser. Works on a folder of your computer; nothing is uploaded.">
+<title>Table annotation</title>
+<link rel="stylesheet" href="static/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="static/app.css">
+<link rel="stylesheet" href="local.css">
+</head>
+<body>
+
+<!-- Home: list of tables -->
+<section id="home" hidden>
+  <header class="home-head">
+    <div>
+      <div class="eyebrow">Table annotation</div>
+      <h1 id="batch-name">…</h1>
+    </div>
+    <div class="spacer"></div>
+    <div class="who-box">Annotator <button id="who-home" class="chip" title="Change annotator"></button></div>
+    <button id="btn-continue" class="primary">Continue →</button>
+  </header>
+  <div class="home-body">
+    <div class="progress-row">
+      <div id="progress-text"></div>
+      <div class="progress"><div id="progress-done"></div><div id="progress-skip"></div><div id="progress-wip"></div></div>
+    </div>
+    <div class="filters">
+      <label><input type="radio" name="filter" value="mine" checked> Assigned to me</label>
+      <label><input type="radio" name="filter" value="all"> All tables</label>
+      <input id="search" type="search" placeholder="Filter by name or group">
+    </div>
+    <table id="task-table" class="list">
+      <thead><tr><th>#</th><th>Table</th><th>Group</th><th>Pre-annotations</th><th>Assigned to</th><th>My status</th><th class="num">My time</th><th>Others</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- Editor -->
+<section id="editor" hidden>
+  <header id="topbar">
+    <button id="btn-home" class="ghost" title="Back to the list of tables">☰ Tables</button>
+    <div class="nav">
+      <button id="btn-prev" class="ghost icon" title="Previous table (Ctrl+Alt+PageUp)">‹</button>
+      <span id="t-pos"></span>
+      <button id="btn-next" class="ghost icon" title="Next table (Ctrl+Alt+PageDown)">›</button>
+    </div>
+    <div class="title"><span id="t-id"></span><span id="t-group"></span></div>
+    <span id="t-status" class="badge"></span>
+    <label class="src" title="Where this table comes from. Choose a source, or a file, to import its text, its structure or its boxes: you see the changes before they are made.">Import <select id="src-select"></select></label>
+    <input type="file" id="src-file" accept=".json,.html,.htm,.xml,.csv,.tsv,.txt" hidden>
+    <label class="src" title="Show another source (or a file) next to your table while you edit: its text, its structure or its boxes. Nothing changes until you take a difference.">Compare <select id="cmp-select"></select></label>
+    <input type="file" id="cmp-file" accept=".json,.html,.htm,.xml,.csv,.tsv,.txt" hidden>
+    <div class="spacer"></div>
+    <span id="save-state" class="save-state"></span>
+    <button id="btn-note" class="ghost" title="Note / flag this table for discussion">Note</button>
+    <button id="btn-skip" class="ghost" title="Not a table, unreadable…">Skip…</button>
+    <button id="btn-done" class="primary" title="Mark as done and open the next table">Done ✓ <kbd>Ctrl+Enter</kbd></button>
+    <button id="who-edit" class="chip" title="Annotator"></button>
+  </header>
+  <div id="banner" hidden></div>
+  <main id="work">
+    <section id="imgpane">
+      <div class="pane-tools">
+        <span class="seg" id="mode-seg"><button data-mode="view" title="Look at the image, follow rows with the red guide">View</button><button data-mode="boxes" title="Draw and fix the box of each cell (Ctrl+E)">▭ Boxes</button></span>
+        <span class="sep"></span>
+        <button data-img="fit" title="Whole image">Fit</button>
+        <button data-img="width" title="Fill the width">Width</button>
+        <button data-img="out" class="icon" title="Zoom out (Ctrl + wheel)">−</button>
+        <span id="zoom-label">100%</span>
+        <button data-img="in" class="icon" title="Zoom in (Ctrl + wheel)">+</button>
+        <span class="sep"></span>
+        <label class="toggle view-only" title="A line under the mouse to follow rows. Click the image to pin it, click again to unpin."><input type="checkbox" id="guide-on" checked> Row guide</label>
+        <button data-img="adjust" class="icon" title="Brightness and contrast">☀</button>
+        <button data-img="colors" class="icon" title="Colors of the box and grid lines">🎨</button>
+        <span class="spacer"></span>
+        <button id="btn-layout" title="Image beside or above the table">⇆ Layout</button>
+      </div>
+      <div id="boxbar" hidden>
+        <div class="pane-tools bx-row" id="bx-normal">
+          <span id="bx-cell"></span>
+          <span class="seg" id="bx-shape"><button data-shape="select" title="The mouse: click a box to select it, drag a rectangle to select several, click an empty spot to select nothing; nothing new is drawn">↖ Select</button><button data-shape="rect" title="Drag to draw a rectangle">▭ Box</button><button data-shape="poly" title="Click the points of a polygon (close it on the first point, double-click or Enter)">⬠ Polygon</button></span>
+          <label class="toggle" title="After drawing a box, select the next cell that has no box"><input type="checkbox" id="bx-next" checked> then next cell</label>
+          <label class="toggle" title="Magnet: the sides of a box you draw, move or resize stick to the boxes next to it, and polygon points to their corners and edges, so boxes touch without a gap. A shared side then moves for both boxes (Alt: alone)"><input type="checkbox" id="bx-snap"> magnet</label>
+          <label class="toggle" title="Write the cell name (E5…) in each box, to check which cell each box belongs to"><input type="checkbox" id="bx-names"> names</label>
+          <span class="spacer"></span>
+          <button data-bx="grid" title="Put a line on every row and column border; every cell gets the box between its lines. Choose how it starts: from the cell boxes or a uniform grid">▦ Grid ▾</button><button data-bx="regrid" id="bx-regrid" hidden title="Open the grid again with the lines these boxes were made from; move them, then Make boxes (boxes fixed by hand are kept)">▦ Back to grid</button>
+          <button data-bx="fit" title="Shrink the box of the selected cells to the writing inside">Fit to ink</button>
+          <button data-bx="merge" title="Merge the selected cells: their boxes become one (Ctrl+M). Shift+click boxes on the image to select them">Merge</button>
+          <button data-bx="assign" title="Give the box of the selected cell to another cell: click this, then the cell in the table">Move to cell…</button>
+          <button data-bx="remove" title="Remove the box of the selected cells (Delete)">Remove</button>
+          <button data-bx="more" title="Boxes from a model, or start from scratch">More ▾</button>
+          <span id="bx-count"></span>
+        </div>
+        <div class="pane-tools bx-row" id="bx-gridbar" hidden>
+          <b>▦ Grid</b><span id="g-size" title="Rows × columns of the grid. Another size than the table: Make boxes resizes the table"><input id="g-rows" type="number" min="1" max="300" aria-label="Rows"> × <input id="g-cols" type="number" min="1" max="300" aria-label="Columns"></span><span id="g-tbl" class="muted"></span>
+          <button data-g="start" title="Start the lines over: from the cell boxes, or a uniform grid (Ctrl+Z goes back)">Start over ▾</button>
+          <button data-g="snap" title="Put each line on the nearest line drawn on the page, or in the middle of the nearest gap between rows of text">Snap</button>
+          <button data-g="even" title="Space the inner lines evenly between the outer ones">Even</button>
+          <button data-g="undo" class="icon" title="Undo the last change of the lines (Ctrl+Z)">↶</button>
+          <button data-g="redo" class="icon" title="Redo (Ctrl+Y)">↷</button>
+          <label class="toggle" title="Boxes you drew or fixed by hand stay as they are; all the other cells get their box from the lines"><input type="checkbox" id="g-keep"> keep my boxes</label>
+          <span class="spacer"></span>
+          <button data-g="cancel" title="Close the grid (Esc)">Cancel</button>
+          <button data-g="apply" class="primary" title="Every cell gets the box between its lines (Enter)">Make boxes</button>
+        </div>
+      </div>
+      <div id="imgview">
+        <div id="imgstage">
+          <img id="img" alt="" draggable="false">
+          <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
+        </div>
+        <div id="imgadj" class="img-float" hidden></div>
+        <div id="bx-move" class="img-float" hidden></div>
+        <div id="box-label" hidden></div>
+        <div id="img-hint">Wheel: scroll · Ctrl+wheel: zoom · drag: move · click: pin row guide</div>
+      </div>
+    </section>
+    <div id="divider" title="Drag to resize"></div>
+    <section id="gridpane">
+      <div class="pane-tools" id="toolbar">
+        <button data-op="undo" title="Undo (Ctrl+Z)">↶</button>
+        <button data-op="redo" title="Redo (Ctrl+Y)">↷</button>
+        <span class="sep"></span>
+        <button data-op="merge" title="Merge the selected cells (Ctrl+M)">Merge</button>
+        <button data-op="split" title="Split a merged cell (Ctrl+Shift+M)">Split</button>
+        <span class="sep"></span>
+        <span class="group-label">Row</span>
+        <button data-op="row-above" title="Insert a row above (Ctrl+Shift+↑)">+↑</button>
+        <button data-op="row-below" title="Insert a row below (Ctrl+Shift+↓)">+↓</button>
+        <button data-op="del-rows" title="Delete the selected rows (Ctrl+−, then R)">✕</button>
+        <span class="group-label">Col</span>
+        <button data-op="col-left" title="Insert a column to the left (Ctrl+Shift+←)">+←</button>
+        <button data-op="col-right" title="Insert a column to the right (Ctrl+Shift+→)">+→</button>
+        <button data-op="del-cols" title="Delete the selected columns (Ctrl+−, then C)">✕</button>
+        <span class="group-label">Cells</span>
+        <button data-op="del-cells" title="Delete the selected cells: the cells on the right move left, or the cells below move up (Ctrl+−, then L or U)">✕</button>
+        <span class="sep"></span>
+        <button data-op="header" title="Mark / unmark as header cell (Ctrl+B)">Header</button>
+        <button data-op="unclear" title="Mark / unmark as unclear reading (Ctrl+U)">Unclear</button>
+        <span class="spacer"></span>
+        <button data-op="new-table" title="Remove the whole annotation and start from an empty grid of the size you choose; the boxes can be kept and put on it by their place">New table…</button>
+        <button data-op="help" class="icon" title="Help: keys and colours (Ctrl+/)">?</button>
+      </div>
+      <div id="cellbar">
+        <span id="cell-ref"></span>
+        <span id="cell-info"></span>
+        <span id="cell-text"></span>
+        <span class="spacer"></span>
+        <span id="palette"></span>
+      </div>
+      <div id="gridrow">
+        <div id="gridwrap" tabindex="0">
+          <table id="grid"></table>
+          <input id="cell-input" type="text" spellcheck="false" autocomplete="off" hidden>
+        </div>
+        <div id="cmp" hidden>
+          <div class="pane-tools">
+            <b>Compare</b><span id="cmp-name"></span>
+            <span class="seg" id="cmp-mode"><button data-cm="text" title="Their text against yours">Text</button><button data-cm="structure" title="Their rows, columns and merges against yours">Structure</button><button data-cm="boxes">Boxes</button></span>
+            <span class="spacer"></span>
+            <span id="cmp-count"></span>
+            <button id="cmp-take" title="Put their text (or box) of the selected differences in your table (Enter in this panel, or double-click a cell)">Take ←</button>
+            <button id="cmp-import" title="Open the import window with this source: see all the changes and take them at once">Import…</button>
+            <button id="cmp-close" class="icon" title="Close the comparison">✕</button>
+          </div>
+          <div id="cmp-detail"></div>
+          <div id="cmp-body" tabindex="0"></div>
+        </div>
+      </div>
+      <div id="statusbar"><span id="stats"></span><span id="import-notes"></span><span class="spacer"></span>
+        <span class="view-tools"><button data-op="font-down" title="Smaller text">A−</button><button data-op="font-up" title="Larger text">A+</button><button data-op="mono" title="Fixed-width font (digits line up)">Mono</button><button data-op="edits" title="Show / hide the green mark on cells you changed">Changes</button></span></div>
+    </section>
+  </main>
+</section>
+
+<!-- Menus and dialogs -->
+<div id="ctxmenu" class="menu" hidden></div>
+<div id="sym-pop" hidden></div>
+<div id="help" hidden role="complementary" aria-label="Help"></div>
+<div id="toast" hidden></div>
+<div id="modal-back" hidden><div id="modal" role="dialog" aria-modal="true"></div></div>
+
+<script src="local.js"></script>
+<script src="static/vendor/katex/katex.min.js"></script>
+<script src="static/app.js"></script>
+</body>
+</html>

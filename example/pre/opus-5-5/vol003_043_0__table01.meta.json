@@ -1,0 +1,4 @@
+{
+ "model": "claude-opus-5-5",
+ "note": "zero-shot answer of a vision-language model, as an HTML table"
+}
