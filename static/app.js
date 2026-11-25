@@ -250,27 +250,95 @@ function resolveOverlaps(m) {
   return fixed;
 }
 const BOX_BY = ['model', 'grid', 'hand'];
-/* Our own JSON (saved annotations, or pre-annotations with boxes). */
-function modelFromJSON(obj) {
-  const cells = (obj.cells || []).map(c => newCell(+c.row, +c.col, +(c.rowspan || 1), +(c.colspan || 1), String(c.text || ''), {
+/* Our own JSON (saved annotations, or pre-annotations with boxes). repair (a model's answer): rows and columns
+   computed when missing, cells outside the grid enlarge it, missing cells are added (striped), overlaps fixed, as
+   for a model's HTML. Also read: row_span / col_span, bbox_2d / box_2d, content [{text}] (lines). A model's "uncertain" is not
+   taken as Unclear: that mark is the annotator's. */
+function modelFromJSON(obj, repair = false) {
+  let list = Array.isArray(obj.cells) ? obj.cells : [];
+  const notes = [];
+  if (repair) {
+    const n = list.length;
+    list = list.filter(c => c && typeof c === 'object' && Number.isInteger(+c.row) && Number.isInteger(+c.col) && +c.row >= 0 && +c.col >= 0);
+    if (list.length < n) notes.push(`${n - list.length} cell${n - list.length > 1 ? 's' : ''} without a row and column left out`);
+  }
+  const span = v => { v = Math.round(+(v ?? 1)); return v >= 1 ? (repair ? Math.min(v, MAX_SPAN) : v) : 1; };
+  const box = v => Array.isArray(v) && v.length === 4 && v.every(x => isFinite(+x)) ? v.map(Number) : null;
+  const textOf = c => c.text != null ? String(c.text) : Array.isArray(c.content) ? c.content.map(l => (l && typeof l === 'object' ? l.text : l) || '').join(' ') : '';
+  const cells = list.map(c => newCell(+c.row, +c.col, span(c.rowspan ?? c.row_span), span(c.colspan ?? c.col_span), repair ? normText(textOf(c)) : String(c.text || ''), {
     header: !!c.header, unclear: !!c.unclear, edited: !!c.edited,
-    bbox: Array.isArray(c.bbox) && c.bbox.length === 4 ? c.bbox.map(Number) : null,
+    bbox: box(c.bbox) || box(c.bbox_2d) || box(c.box_2d),
     polygon: Array.isArray(c.polygon) && c.polygon.length > 2 ? c.polygon.map(p => [+p[0], +p[1]]) : null,
   }));
-  for (const [k, c] of (obj.cells || []).entries()) {
+  for (const [k, c] of list.entries()) {
     const x = cells[k];
     if (x.polygon) x.bbox = bboxOf(x.polygon);
     x.box_by = !x.bbox ? null : BOX_BY.includes(c.box_by) ? c.box_by : c.box_edited ? 'hand' : 'model';
   }
   const m = { nRows: +obj.n_rows, nCols: +obj.n_cols, cells };
+  if (repair) {
+    if (!cells.length) return { model: null, notes: notes.concat(['the table has no cells']) };
+    for (const [key, ext, word] of [['nRows', c => c.r + c.rs, 'rows'], ['nCols', c => c.c + c.cs, 'columns']]) {
+      const need = Math.max(...cells.map(ext));
+      if (!(m[key] >= 1)) m[key] = need;
+      else if (need > m[key]) { notes.push(`${need - m[key]} ${word} added for cells outside the ${m[key]} given`); m[key] = need; }
+    }
+    if (m.nRows > 1000 || m.nCols > 300) return { model: null, notes: notes.concat([`too big for a table: ${m.nRows} rows, ${m.nCols} columns`]) };
+    // a span running over a cell the model also lists: the span is cut there (both cells and their text kept)
+    const anchor = new Set(cells.map(c => c.r + ',' + c.c));
+    let cut = 0;
+    for (const c of cells) {
+      const hit = (r, k) => (r !== c.r || k !== c.c) && anchor.has(r + ',' + k);
+      let cs = c.cs, rs = c.rs;
+      for (let k = 1; k < cs; k++) { let h = false; for (let r = c.r; r < c.r + rs; r++) if (hit(r, c.c + k)) h = true; if (h) { cs = k; break; } }
+      for (let j = 1; j < rs; j++) { let h = false; for (let k = c.c; k < c.c + cs; k++) if (hit(c.r + j, k)) h = true; if (h) { rs = j; break; } }
+      if (cs !== c.cs || rs !== c.rs) { c.cs = cs; c.rs = rs; cut++; }
+    }
+    const s = slotsOf(m);
+    let padded = 0, fixed = 0;
+    for (let r = 0; r < m.nRows; r++) for (let k = 0; k < m.nCols; k++) if (s[r][k] === -1) { cells.push(newCell(r, k, 1, 1, '', { padded: true })); padded++; }
+    for (let guard = 0; guard < 5 && checkModel(m); guard++) fixed += resolveOverlaps(m);
+    if (cut) notes.push(`${cut} merged cell${cut > 1 ? 's' : ''} cut where another cell starts`);
+    if (padded) notes.push(`${padded} missing cell${padded > 1 ? 's' : ''} added (striped)`);
+    if (fixed) notes.push(`${fixed} cell${fixed > 1 ? 's' : ''} at the same place left out`);
+  }
   const err = checkModel(m);
-  return { model: err ? null : sortCells(m), notes: err ? ['JSON table is not a valid grid: ' + err] : [] };
+  return { model: err ? null : sortCells(m), notes: err ? notes.concat(['JSON table is not a valid grid: ' + err]) : notes };
+}
+/* A model's JSON answer: a ```json fence or text around the object is left out; an answer cut off is read up to its
+   last whole cell (noted "answer cut off", like an HTML answer without </table>). */
+function parseAnswerJSON(raw) {
+  let t = String(raw).replace(/^\uFEFF/, '');
+  if (!/^\s*[{[]/.test(t)) { const f = t.match(/```(?:json)?[ \t]*\r?\n?([\s\S]*?)(?:```|$)/i); if (f) t = f[1]; }
+  const a = t.indexOf('{');
+  if (a < 0) throw new Error('no JSON in this answer');
+  t = t.slice(a);
+  const end = t.lastIndexOf('}');
+  let first;
+  try { return { obj: JSON.parse(t.slice(0, end + 1)), cut: false }; } catch (e) { first = e; }
+  const k = t.indexOf('"cells"');
+  if (k < 0) throw first;
+  for (let p = t.lastIndexOf('}'), tries = 0; p > k && tries < 600; p = t.lastIndexOf('}', p - 1), tries++) {
+    try { return { obj: JSON.parse(t.slice(0, p + 1) + ']}'), cut: true }; } catch (e) { /* not the end of a cell */ }
+  }
+  throw first;
+}
+function modelFromAnswerJSON(raw) {
+  const { obj, cut } = parseAnswerJSON(raw);
+  if (!obj || !Array.isArray(obj.cells)) {
+    const html = findTableHTML(obj);
+    if (html) return modelFromHTML(html);
+    return { model: null, notes: ['no "cells" in this JSON'] };
+  }
+  const res = modelFromJSON(obj, true);
+  if (cut) res.notes.unshift('answer cut off: read up to its last whole cell');
+  return res;
 }
 function importSource(src) {
   if (!S.imports[src]) {
     const p = S.detail.pre[src];
     let res;
-    try { res = p.kind === 'json' ? modelFromJSON(JSON.parse(p.text)) : modelFromHTML(p.text); }
+    try { res = p.kind === 'json' ? modelFromAnswerJSON(p.text) : modelFromHTML(p.text); }
     catch (e) { res = { model: null, notes: ['could not read: ' + e.message] }; }
     if (res.model) scaleBoxes(res, (S.batch.box_formats || {})[src]);
     S.imports[src] = res;
@@ -3448,10 +3516,11 @@ function fileSource(fname, raw) {
   const src = { name: 'file ' + fname, file: fname, notes: [], model: null };
   const set = res => { src.model = res.model; src.notes = res.notes.slice(); };
   try {
-    if (/^[{[]/.test(head)) {
-      const obj = JSON.parse(text);
-      if (obj && Array.isArray(obj.cells) && obj.n_rows != null) {
-        set(modelFromJSON(obj));
+    if (/^([{[]|```)/.test(head)) {
+      const { obj, cut } = parseAnswerJSON(text);
+      if (obj && Array.isArray(obj.cells)) {
+        set(modelFromJSON(obj, !obj.schema));  // a saved annotation as it is; a model's answer repaired
+        if (cut) src.notes.unshift('answer cut off: read up to its last whole cell');
         if (obj.annotator) src.name = `file ${fname} (${obj.annotator})`;
         if (obj.table_id && obj.table_id !== S.tid) src.notes.push(`this file is for the table ${obj.table_id}`);
         const size = S.detail.image_size, was = obj.image_size;

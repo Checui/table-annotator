@@ -55,7 +55,10 @@ is the image's file name without its extension). With no `pre/` folder, the tool
   ]}
   ```
 
-  Rows and columns count from 0; the cells must cover the grid exactly once.
+  Rows and columns count from 0. A model's raw JSON answer, saved as `.json`, is read too: inside a
+  ```` ```json ```` fence, with `row_span` / `col_span` or a `box_2d` / `bbox_2d` box, or cut off (read up to its
+  last whole cell). Its mistakes are fixed as for HTML: missing rows and columns counted, overlapping cells cut,
+  missing cells added (shown striped).
 - Boxes are in pixels of the table image. For boxes on a 0–1000 scale, set in `batch.json`
   `"box_formats": {"<model>": "norm1000"}` (`[x0, y0, x1, y1]`) or `"gemini"` (`[ymin, xmin, ymax, xmax]`).
 - Inside the tool, **Import ▾ → From a file…** also reads PAGE XML (TableRegion > TableCell) and CSV / TSV, one
