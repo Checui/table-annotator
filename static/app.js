@@ -572,6 +572,61 @@ function setCellText(i, text) {
   return 'text';
 }
 
+/* Replace…: a text in the selected cells (several selected) or in the whole table, inside the text of the cells or
+   only cells that are exactly that text. One step: Ctrl+Z undoes it. */
+function replaceDialog() {
+  if (S.editing !== null) stopEditing(true);
+  const rect = rectOfSel(), sel = cellsInRect(rect), m = S.model, many = sel.length > 1;
+  const last = LS.get('replace', { find: '', with: '', whole: false, cs: true });
+  const range = `${cellRef(m.cells[S.slots[rect.r0][rect.c0]])}:${cellRef(m.cells[S.slots[rect.r1][rect.c1]])}`;
+  openModal(`<h2>Replace text</h2>
+    <div class="rp-grid">
+      <label for="rp-find">Find</label><input id="rp-find" type="text" spellcheck="false" autocomplete="off" value="${escAttr(last.find)}">
+      <label for="rp-with">Replace with</label><input id="rp-with" type="text" spellcheck="false" autocomplete="off" value="${escAttr(last.with)}">
+    </div>
+    <div class="choices rp-opts">
+      <label><input type="radio" name="rp-in" value="sel"${many ? ' checked' : ' disabled'}> In the selected cells${many ? ` (${range}, ${sel.length} cells)` : ' (select several cells first)'}</label>
+      <label><input type="radio" name="rp-in" value="all"${many ? '' : ' checked'}> In the whole table</label>
+      <label><input type="checkbox" id="rp-whole"${last.whole ? ' checked' : ''}> Only cells that are exactly this text (not inside a longer text)</label>
+      <label><input type="checkbox" id="rp-cs"${last.cs ? ' checked' : ''}> Match capitals</label>
+    </div>
+    <p id="rp-msg" class="muted"></p>
+    <div class="actions"><button data-close>Cancel</button><button class="primary" id="rp-ok" disabled>Replace</button></div>`, {
+    onKey: e => { if (e.key === 'Enter' && !e.shiftKey && !$('#rp-ok').disabled) { e.preventDefault(); $('#rp-ok').click(); return true; } return false; },
+  });
+  const plan = () => {
+    const find = $('#rp-find').value, rep = $('#rp-with').value, whole = $('#rp-whole').checked, cs = $('#rp-cs').checked;
+    const where = document.querySelector('input[name="rp-in"]:checked').value === 'sel' ? sel : m.cells.map((_, i) => i);
+    const out = [];
+    if (!find) return { out, find, rep, whole, cs };
+    const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), cs ? 'g' : 'gi');
+    for (const i of where) {
+      const t = m.cells[i].text;
+      const nt = whole ? ((cs ? t === find : t.toLowerCase() === find.toLowerCase()) ? rep : t) : t.replace(re, () => rep);
+      if (nt !== t) out.push([i, nt]);
+    }
+    return { out, find, rep, whole, cs };
+  };
+  const show = () => {
+    const p = plan(), n = p.out.length;
+    $('#rp-msg').textContent = !p.find ? 'Type the text to find.'
+      : n ? `${n} cell${n > 1 ? 's' : ''} will change: ${p.out.slice(0, 8).map(([i]) => cellRef(m.cells[i])).join(', ')}${n > 8 ? ', …' : ''}` : 'No cell has this text.';
+    $('#rp-ok').disabled = !n;
+    $('#rp-ok').textContent = n ? `Replace in ${n} cell${n > 1 ? 's' : ''}` : 'Replace';
+  };
+  $$('#modal input').forEach(i => i.addEventListener(i.type === 'text' ? 'input' : 'change', show));
+  show();
+  $('#rp-find').focus(); $('#rp-find').select();
+  $('#rp-ok').onclick = () => {
+    const p = plan();
+    LS.set('replace', { find: p.find, with: p.rep, whole: p.whole, cs: p.cs });
+    closeModal();
+    let n = 0;
+    apply('replace', () => { for (const [i, t] of p.out) if (setCellText(i, t)) n++; return n ? 'text' : false; });
+    toast(n ? `Replaced in ${n} cell${n > 1 ? 's' : ''}. Ctrl+Z undoes it.` : 'Nothing was changed.');
+  };
+}
+
 /* Run an operation with undo, re-render and autosave. */
 function snapshot() { return { model: cloneModel(S.model), sel: Object.assign({}, S.sel), from: S.meta.started_from }; }
 function restore(st) { S.model = st.model; S.sel = st.sel; S.meta.started_from = st.from; }
@@ -589,27 +644,54 @@ function apply(name, fn) {
     console.error('broken grid after', name, err);
     return false;
   }
+  if (BX.grid) before.gs = BX.gs;  // a change of the table while the grid is open
   S.undo.push(before); if (S.undo.length > 300) S.undo.shift();
   S.redo = [];
   S.meta.edit_counts[kind] = (S.meta.edit_counts[kind] || 0) + 1;
   changed();
   return true;
 }
+/* Undo / redo. While the grid is open, the changes of the lines and of the table are one history: a change of the
+   lines is a step that also keeps the lines (grid, fresh) and the grid session (gs). Ctrl+Z undoes the last change,
+   wherever it was. */
 function undo() {
   endAssign();
-  if (BX.grid) return gridUndo(false);
-  if (!S.undo.length) return toast('Nothing to undo.');
-  const back = BX.lastGrid && S.undo[S.undo.length - 1] === BX.lastGrid.snap ? BX.lastGrid.g : null;
-  S.redo.push(snapshot());
-  restore(S.undo.pop()); changed(); renderSourceSelect();
-  if (back) { BX.lastGrid = null; openGrid('again', back); toast('Make boxes undone: the grid is open again with its lines.', 5000); }
+  if (BX.grid && BX.drag) return;
+  if (!S.undo.length) return toast(BX.grid ? 'Nothing to undo. (Cancel puts the boxes back as they were.)' : 'Nothing to undo.');
+  const st = S.undo[S.undo.length - 1];
+  const back = !BX.grid && BX.lastGrid && st === BX.lastGrid.snap ? BX.lastGrid.g : null;
+  S.redo.push(histNow(st));
+  S.undo.pop();
+  histRestore(st);
+  if (back) { BX.lastGrid = null; openGrid('again', back); toast('The boxes of the grid are undone: the grid is open again with its lines.', 5000); }
 }
 function redo() {
   endAssign();
-  if (BX.grid) return gridUndo(true);
+  if (BX.grid && BX.drag) return;
   if (!S.redo.length) return toast('Nothing to redo.');
-  S.undo.push(snapshot());
-  restore(S.redo.pop()); changed(); renderSourceSelect();
+  const st = S.redo[S.redo.length - 1];
+  S.undo.push(histNow(st));
+  S.redo.pop();
+  histRestore(st);
+}
+const histLines = st => !!(BX.grid && st.gtag && st.gs === BX.gs);  // a step of the lines of the open grid
+function histNow(st) {  // the state now, for the other list; with the lines when st is a step of the lines
+  const cur = snapshot();
+  if (st.gs !== undefined) cur.gs = st.gs;
+  if (histLines(st)) Object.assign(cur, { grid: cloneGrid(BX.grid), fresh: !!BX.gridFresh, partial: Object.assign({}, BX.partial), gtag: true });
+  return cur;
+}
+function histRestore(st) {
+  const lines = histLines(st);
+  restore(st);
+  BX.nudged = null;
+  if (lines) {
+    BX.grid = cloneGrid(st.grid); BX.gridFresh = st.fresh; BX.partial = Object.assign({}, st.partial); BX.gSel = null; BX.gridHotKey = null;
+    S.meta.grid_lines = !gridSteps() ? BX.gridStartLines
+      : !BX.gridFresh && !gridSizeDiffers() ? { h: BX.grid.h.map(l => l.map(round1)), v: BX.grid.v.map(l => l.map(round1)) } : S.meta.grid_lines;
+  }
+  changed(); renderSourceSelect();
+  if (BX.grid) { drawBoxes(); drawOverlay(); drawGrid(); renderBoxbar(); }
 }
 function refreshSlots() {
   S.slots = slotsOf(S.model);
@@ -624,6 +706,7 @@ function changed() {
   if (S.meta.status === 'todo') { S.meta.status = 'in_progress'; renderTopbar(); }
   scheduleSave();
   if (CMP) cmpRefresh();
+  if (BX.grid) drawGrid();  // the grid shows the merged cells of the table
 }
 
 // ------------------------------------------------------------------------------------------
@@ -797,7 +880,7 @@ async function openTask(tid) {
     started_from: ann ? ann.started_from : null, edit_counts: ann ? (ann.edit_counts || {}) : {},
     rev: ann ? ann.rev : 0, created: ann ? ann.created : null, grid_lines: ann ? ann.grid_lines || null : null,
   };
-  closeGrid(false);
+  closeGrid('drop');
   S.active.seconds = S.active.saved = ann ? (ann.time_active_s || 0) : 0;
   hideBanner();
   let notes = [];
@@ -828,8 +911,9 @@ async function openTask(tid) {
   setImportNotes(notes);
   loadImage();
   renderGrid();
+  $('#marks-on').checked = true;
   setBoxMode(LS.get('boxmode', false));
-  applyAdjust(); applyLineColors();
+  applyAdjust(); applyLineColors(); applyKeyTitles();
   $('#gridwrap').scrollTo(0, 0);
   renderSel();
   $('#gridwrap').focus();
@@ -858,12 +942,31 @@ function setImportNotes(notes) {
   $('#import-notes').textContent = notes && notes.length ? `${src || 'Pre-annotation'}: ${notes.join(' · ')}` : '';
   $('#import-notes').title = $('#import-notes').textContent;
 }
+/* A long table name is cut in the middle (its end, often the table number, stays); hover shows it whole. */
+function fitTitle() {
+  const el = $('#t-id'), full = el.title || el.textContent;
+  el.textContent = full;
+  if (!el.clientWidth || el.scrollWidth <= el.clientWidth) return;
+  let lo = 4, hi = full.length;
+  while (lo < hi) {
+    const n = Math.ceil((lo + hi) / 2), a = Math.ceil(n * 0.6);
+    el.textContent = full.slice(0, a) + '…' + full.slice(full.length - (n - a));
+    if (el.scrollWidth <= el.clientWidth) lo = n; else hi = n - 1;
+  }
+  const a = Math.ceil(lo * 0.6);
+  el.textContent = full.slice(0, a) + '…' + full.slice(full.length - (lo - a));
+}
+window.addEventListener('resize', () => { if (S.view === 'edit' && S.detail) fitTitle(); });
+let FIT_T = 0;  // the rest of the top bar changes (menus, save state): the name is cut again
+new MutationObserver(ms => { if (ms.some(m => !$('#t-id').contains(m.target))) { cancelAnimationFrame(FIT_T); FIT_T = requestAnimationFrame(() => { if (S.view === 'edit' && S.detail) fitTitle(); }); } })
+  .observe($('#topbar'), { childList: true, subtree: true, characterData: true });
 function renderTopbar() {
   const list = myTasks(), pos = list.findIndex(t => t.table_id === S.tid);
   $('#t-pos').textContent = pos >= 0 ? `${pos + 1} / ${list.length}` : '';
   const t = S.detail.task;
   $('#t-id').textContent = t.table_id;
   $('#t-id').title = t.table_id;
+  fitTitle();
   $('#t-group').textContent = [t.group, t.note].filter(Boolean).join(' · ');
   const st = $('#t-status');
   st.className = 'badge ' + S.meta.status;
@@ -881,11 +984,15 @@ function renderSourceSelect() {
     const warn = !res.model || res.notes.some(n => n.startsWith('answer cut off')) ? ' ⚠ ' + (res.model ? 'cut off' : '') : '';
     return `<option value="${escAttr(s)}">${esc(s)} (${size})${warn}</option>`;
   });
-  if (sf.source && !S.detail.pre[sf.source]) opts.unshift(`<option value="__cur" disabled>${esc(sf.source)}</option>`);
+  // The menu shows where the table comes from on a hidden entry, so that every source, the current one too, can be
+  // picked again (e.g. to take back hisclima-gt's boxes after changing them): a select fires no change on its own value.
+  const cur = sf.source ? (S.detail.pre[sf.source] ? opts[S.batch.sources.filter(s => S.detail.pre[s]).indexOf(sf.source)].replace(/^<option value="[^"]*">|<\/option>$/g, '') : esc(sf.source)) : 'Empty table';
+  opts.unshift(`<option value="__cur" disabled hidden>${cur}</option>`);
   opts.push('<option value="__file">From a file…</option>', '<option value="__empty">New empty table…</option>');
   sel.innerHTML = opts.join('');
-  sel.value = sf.source ? (S.detail.pre[sf.source] ? sf.source : '__cur') : '__empty';
+  sel.value = '__cur';
   sel.dataset.current = sel.value;
+  sel.dataset.src = sf.source || '';
   const how = { full: 'structure and text', structure: 'structure only' }[sf.mode] || sf.mode;
   sel.title = (sf.source ? `This table comes from ${sf.source} (${how})` : 'This table started from an empty grid')
     + (sf.mixed && sf.mixed.length ? ', mixed with ' + sf.mixed.map(x => `the ${x.part} of ${x.source}`).join(', ') : '')
@@ -1163,8 +1270,11 @@ let pendingDelete = false;
 document.addEventListener('keydown', e => {
   if (!$('#modal-back').hidden) { if (modalOpts.onKey && modalOpts.onKey(e)) return; if (e.key === 'Escape') closeModal(); return; }
   if (S.view !== 'edit') return;
-  const k = e.key, ctrl = e.ctrlKey || e.metaKey;
+  const k = e.key, ctrl = e.ctrlKey || e.metaKey, act = keyAction(e);
+  if (act === 'hide') { e.preventDefault(); if (!e.repeat && !HK.down) { toggleMarks(); HK.down = { t: Date.now(), b: keysOf('hide').find(b => keyMatches(b, e)) }; } return; }
   if (k === 'Escape' && !$('#sym-pop').hidden) { e.preventDefault(); closeSymPop(); return; }
+  if (k === 'Escape' && !$('#g-opts').hidden) { e.preventDefault(); gridOpts(false); return; }
+  if (k === 'Escape' && !$('#ctxmenu').hidden) { e.preventDefault(); hideMenu(); return; }  // the menu first, not the grid
   if (document.activeElement && document.activeElement.closest('#sym-pop, #help')) return;  // typing in the Symbols or help search
   if (BX.assign !== null && k === 'Escape') { e.preventDefault(); endAssign(); return; }
   if (BX.poly && (k === 'Escape' || k === 'Enter' || k === 'Backspace')) {
@@ -1182,7 +1292,13 @@ document.addEventListener('keydown', e => {
     BX.drag = null; clearDraft(); drawBoxes(); drawOverlay(); if (BX.grid) drawGrid();
     return;
   }
-  if (BX.grid && S.editing === null && !isFormFocus() && (k === 'Escape' || (k === 'Enter' && !ctrl))) { e.preventDefault(); closeGrid(k === 'Enter'); return; }
+  if (BX.grid && BX.gTool && k === 'Escape' && S.editing === null && !isFormFocus()) { e.preventDefault(); gridTool(null); return; }
+  if (BX.grid && BX.gSel && S.editing === null && !isFormFocus() && !ctrl && !e.altKey) {
+    const keys = BX.gSel.ax === 'h' ? ['ArrowUp', 'ArrowDown'] : ['ArrowLeft', 'ArrowRight'];
+    if (keys.includes(k)) { e.preventDefault(); gridNudge(k === keys[0] ? -1 : 1, e.shiftKey); return; }
+    if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); gridLineDel(BX.gSel.ax, BX.gSel.i); return; }
+  }
+  if (BX.grid && S.editing === null && !isFormFocus() && (k === 'Escape' || (k === 'Enter' && !ctrl))) { e.preventDefault(); closeGrid(k === 'Enter' ? 'done' : 'keep'); return; }
   if (BX.on && k === ' ' && !ctrl && !e.altKey && IV.hover && S.editing === null) {  // Space + drag moves the image
     e.preventDefault();
     if (!BX.space) { BX.space = true; $('#imgview').style.cursor = 'grab'; drawGuide(); }
@@ -1194,11 +1310,9 @@ document.addEventListener('keydown', e => {
     const ch = quickSymbols()[n - 1];
     if (ch) { e.preventDefault(); insertChar(ch); return; }
   }
-  if (ctrl && !e.altKey && (k === '.' || k === ',') && !isFormFocus()) {
-    e.preventDefault(); wrapRich(k === '.' ? 'sup' : 'sub'); return;
-  }
+  if ((act === 'sup' || act === 'sub' || act === 'math') && !isFormFocus()) { e.preventDefault(); wrapRich(act); return; }
   if (S.editing !== null) {
-    if (k === 'Enter' && ctrl) { e.preventDefault(); stopEditing(true); markDone(); return; }
+    if (act === 'done') { e.preventDefault(); stopEditing(true); markDone(); return; }
     if (k === 'Enter' || k === 'Tab' || k === 'ArrowUp' || k === 'ArrowDown') {
       e.preventDefault();
       stopEditing(true);
@@ -1216,24 +1330,12 @@ document.addEventListener('keydown', e => {
     if (k === 'l' || k === 'L' || k === 'u' || k === 'U') { e.preventDefault(); const rect = rectOfSel(); apply('del-cells', () => deleteCells(k.toLowerCase() === 'l' ? 'left' : 'up', rect, LS.get('dcboxes', false))); return; }
     if (k === 'Escape') return;
   }
-  if (ctrl && k === 'Enter') { e.preventDefault(); markDone(); return; }
-  if (ctrl && e.altKey && (k === 'PageDown' || k === 'PageUp')) { e.preventDefault(); goRelative(k === 'PageDown' ? 1 : -1); return; }
-  if (ctrl && e.shiftKey && k.startsWith('Arrow')) {
-    e.preventDefault();
-    apply('insert', OPS[{ ArrowUp: 'row-above', ArrowDown: 'row-below', ArrowLeft: 'col-left', ArrowRight: 'col-right' }[k]]);
-    return;
-  }
-  if (ctrl && !e.altKey) {
+  if (act) { e.preventDefault(); runKeyAction(act); return; }  // the keys chosen in ⌨ Keys
+  if (ctrl && !e.altKey) {  // the basic keys: fixed
     const key = k.toLowerCase();
     if (key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); return; }
     if (key === 'y' || (key === 'z' && e.shiftKey)) { e.preventDefault(); redo(); return; }
-    if (key === 'm') { e.preventDefault(); apply(e.shiftKey ? 'split' : 'merge', OPS[e.shiftKey ? 'split' : 'merge']); return; }
-    if (key === 'b') { e.preventDefault(); apply('header', OPS.header); return; }
-    if (key === 'u') { e.preventDefault(); apply('unclear', OPS.unclear); return; }
     if (key === 's') { e.preventDefault(); save(true); return; }
-    if (key === 'e') { e.preventDefault(); if (boxPolicy() !== 'off') setBoxMode(!BX.on); return; }
-    if (key === '/') { e.preventDefault(); helpToggle(); return; }
-    if (k === '-' || e.code === 'NumpadSubtract' || e.code === 'Minus') { e.preventDefault(); askDelete(); return; }
     if (key === 'a') { e.preventDefault(); S.sel = { ar: 0, ac: 0, er: S.model.nRows - 1, ec: S.model.nCols - 1 }; renderSel(false); return; }
     if (k === 'Home') { e.preventDefault(); setSel(0, 0); return; }
     if (k === 'End') { e.preventDefault(); setSel(S.model.nRows - 1, S.model.nCols - 1); return; }
@@ -1265,6 +1367,7 @@ document.addEventListener('keydown', e => {
   if (isTyping(e)) { e.preventDefault(); startEditing(k); }
 });
 document.addEventListener('keyup', e => {
+  hideKeyUp(e);
   if (e.key === ' ' && BX.space) { BX.space = false; $('#imgview').style.cursor = ''; drawGuide(); }
   if (e.key === 'Alt' && BX.on && IV.hover) e.preventDefault();  // Alt+drag: no browser menu on release
 });
@@ -1333,6 +1436,7 @@ function pasteTSV(text) {
 let dragSel = false;
 $('#grid').addEventListener('mousedown', e => {
   if (e.button !== 0) return;
+  if (BX.gSel) gridSelLine(null);
   const td = e.target.closest('td'), th = e.target.closest('th');
   if (BX.assign !== null) { e.preventDefault(); if (td) assignTo(+td.dataset.i); else endAssign(); return; }
   if (S.editing !== null) stopEditing(true);
@@ -1373,6 +1477,12 @@ $('#grid').addEventListener('pointerover', e => {
 $('#grid').addEventListener('pointerleave', () => { if (BOX[tdHov] && tdHov !== BX.hover) BOX[tdHov].classList.remove('hov'); tdHov = -1; });
 $('#grid').addEventListener('dblclick', e => { if (e.target.closest('td')) startEditing(); });
 $('#imgview').addEventListener('contextmenu', e => {
+  if (marksHidden() && !e.target.closest('.img-float')) { e.preventDefault(); return toast(`The ${BX.grid ? 'grid lines' : 'boxes'} are hidden: ${hideHow(BX.grid ? 'Show lines' : 'Show boxes')} brings them back.`, 3000); }
+  if (BX.on && BX.grid && S.model && !e.target.closest('.img-float')) {
+    e.preventDefault();
+    if (BX.gridFresh) return toast('Drag a rectangle around the table first.');
+    return gridLineMenu(e.clientX, e.clientY, imgPt(e));
+  }
   if (!BX.on || BX.grid || !S.model || e.target.closest('.img-float')) return;
   const j = boxAt(imgPt(e));
   if (j < 0) return;
@@ -1415,7 +1525,8 @@ const MENU = [
   ['row-above', 'Insert row above', 'Ctrl+Shift+↑'], ['row-below', 'Insert row below', 'Ctrl+Shift+↓'],
   ['col-left', 'Insert column left', 'Ctrl+Shift+←'], ['col-right', 'Insert column right', 'Ctrl+Shift+→'], null,
   ['del-rows', 'Delete row(s)', ''], ['del-cols', 'Delete column(s)', ''], ['del-cells', 'Delete cells… (the others move left or up)', 'Ctrl+−'], null,
-  ['header', 'Header cell on / off', 'Ctrl+B'], ['unclear', 'Unclear reading on / off', 'Ctrl+U'], ['clear', 'Clear text', 'Del'],
+  ['header', 'Header cell on / off', 'Ctrl+B'], ['unclear', 'Unclear reading on / off', 'Ctrl+U'], ['clear', 'Clear text', 'Del'], null,
+  ['replace', 'Replace text…', 'Ctrl+Shift+F'],
 ];
 function showMenu(x, y) {
   const items = MENU.slice();
@@ -1424,7 +1535,7 @@ function showMenu(x, y) {
 }
 function showMenuItems(x, y, items) {
   const menu = $('#ctxmenu');
-  menu.innerHTML = items.map(it => it ? `<button data-op="${escAttr(it[0])}"${it[0] ? '' : ' disabled'}><span>${esc(it[1])}</span><kbd>${esc(it[2])}</kbd></button>` : '<hr>').join('').replace(/<kbd><\/kbd>/g, '');
+  menu.innerHTML = items.map(it => it ? `<button data-op="${escAttr(it[0])}"${it[0] ? '' : ' disabled'}><span>${esc(keyText(it[1]))}</span><kbd>${esc(keyText(it[2]))}</kbd></button>` : '<hr>').join('').replace(/<kbd><\/kbd>/g, '');
   menu.hidden = false;
   const r = menu.getBoundingClientRect();
   menu.style.left = Math.min(x, innerWidth - r.width - 8) + 'px';
@@ -1438,12 +1549,16 @@ function runOp(op) {
   if (op === 'undo') return undo();
   if (op === 'redo') return redo();
   if (op === 'help') return helpToggle();
+  if (op === 'keys') return openKeys();
   if (op.startsWith('bx-take:')) return takeBoxesDialog(op.slice(8));
   if (op === 'bx-clear') return clearBoxesDialog();
   if (op === 'bx-assign') return startAssign();
   if (op === 'del-cells') return deleteCellsDialog();
   if (op === 'new-table') return newTableDialog();
+  if (op === 'replace') return replaceDialog();
   if (op.startsWith('grid:')) return gridOp(op.slice(5));
+  if (op.startsWith('gline:')) return gridLineOp(op);
+  if (op.startsWith('gcell:')) return gridCellOp(op);
   if (op === 'mono' || op === 'edits') {
     LS.set(op, !LS.get(op, op === 'edits')); applyViewPrefs(); return;
   }
@@ -1456,7 +1571,7 @@ function runOp(op) {
   apply(op, OPS[op]);
   $('#gridwrap').focus({ preventScroll: true });
 }
-['#toolbar', '#statusbar'].forEach(id => $(id).addEventListener('click', e => { const b = e.target.closest('button[data-op]'); if (b) runOp(b.dataset.op); }));
+['#toolbar', '#statusbar', '#topbar'].forEach(id => $(id).addEventListener('click', e => { const b = e.target.closest('button[data-op]'); if (b) runOp(b.dataset.op); }));
 $('#palette').addEventListener('mousedown', e => { e.preventDefault(); });  // the cell being edited keeps the focus
 $('#palette').addEventListener('click', e => {
   const r = e.target.closest('[data-rich]');
@@ -1521,6 +1636,23 @@ function imgFit(mode) {
   LS.set('imgfit', mode);
   imgApply();
 }
+/* Change the panes (box mode on / off) and keep the image as it was: the same zoom and the same place in the
+   middle of the pane. Not zoomed (the image fits the pane): it fits the new pane, around the same place. */
+function imgKeepView(change) {
+  const v = $('#imgview'), W0 = v.clientWidth, H0 = v.clientHeight, mode = LS.get('imgfit', 'width');
+  const fitOf = (W, H) => (mode === 'width' ? W / IV.w : Math.min(W / IV.w, H / IV.h));
+  const zoomed = W0 > 0 && Math.abs(IV.scale / fitOf(W0, H0) - 1) > 0.01;
+  const cx = (W0 / 2 - IV.tx) / IV.scale, cy = (H0 / 2 - IV.ty) / IV.scale;
+  change();
+  const W = v.clientWidth, H = v.clientHeight;
+  if (!W0 || !W) return imgFit(mode);
+  if (!zoomed && mode !== 'width') return imgFit(mode);
+  IV.scale = zoomed ? IV.scale : fitOf(W, H);
+  IV.tx = mode === 'width' && !zoomed ? 0 : W / 2 - cx * IV.scale;
+  IV.ty = Math.min(0, Math.max(H - IV.h * IV.scale, H / 2 - cy * IV.scale));
+  if (IV.h * IV.scale < H) IV.ty = mode === 'width' ? 0 : (H - IV.h * IV.scale) / 2;  // shorter than the pane: as Width / Fit place it
+  imgApply();
+}
 function imgZoom(f, cx, cy) {
   const v = $('#imgview');
   if (cx === undefined) { cx = v.clientWidth / 2; cy = v.clientHeight / 2; }
@@ -1533,8 +1665,7 @@ $('#imgpane .pane-tools').addEventListener('click', e => {
   if (b.dataset.mode) return setBoxMode(b.dataset.mode === 'boxes');
   const a = b.dataset.img;
   if (a === 'fit' || a === 'width') imgFit(a);
-  else if (a === 'adjust') toggleAdjust();
-  else if (a === 'colors') toggleColors();
+  else if (a === 'adjust' || a === 'colors') toggleDisplay();
   else imgZoom(a === 'in' ? 1.25 : 0.8);
 });
 $('#imgview').addEventListener('wheel', e => {
@@ -1554,14 +1685,22 @@ $('#imgview').addEventListener('pointerdown', e => {
   if (e.target.closest('.img-float')) return;
   if (e.button !== 0 && e.button !== 1) return;
   const view = $('#imgview');
-  if (e.button === 0 && BX.on && !BX.space && IV.w && S.model) {
+  if (e.button === 0 && BX.on && !BX.space && !marksHidden() && IV.w && S.model) {
     const p = imgPt(e);
     if (S.editing !== null) stopEditing(true);
-    if (BX.grid) {
-      const hit = BX.gridFresh || e.shiftKey ? null : gridHit(p);  // no outline yet, or Shift: always a new outline
-      BX.drag = hit ? { kind: 'grid', hit, start: p, orig: cloneGrid(BX.grid), moved: false, alone: e.altKey } : { kind: 'gframe', start: p, moved: false };
+    if (BX.grid && BX.gTool === 'del' && !BX.gridFresh) {  // remove lines: a click removes the line, a drag moves the image
+      e.preventDefault();
+      pan = { x: e.clientX, y: e.clientY, tx: IV.tx, ty: IV.ty, moved: false, click: false, gdel: true };
       view.setPointerCapture(e.pointerId);
       return;
+    }
+    if (BX.grid) {
+      const hit = BX.gridFresh || e.shiftKey ? null : gridHit(p);  // no outline yet, or Shift: always a new outline
+      if (hit) BX.drag = { kind: 'grid', hit, start: p, orig: cloneGrid(BX.grid), moved: false, alone: e.altKey };
+      else if (BX.gridFresh || e.shiftKey) BX.drag = { kind: 'gframe', start: p, moved: false };
+      else if (gridInside(p)) BX.drag = { kind: 'gnear', start: p, orig: cloneGrid(BX.grid), moved: false, alone: e.altKey };  // the nearest line, in the direction of the drag
+      if (BX.drag) { view.setPointerCapture(e.pointerId); return; }
+      gridSelLine(null);  // outside the grid: a drag moves the image (below)
     } else {
       if (BX.assign !== null) { const j = boxAt(p); if (j >= 0) assignTo(j); else endAssign(); return; }
       const ctrl = e.ctrlKey || e.metaKey;
@@ -1605,6 +1744,7 @@ $('#imgview').addEventListener('pointermove', e => {
     if (pan.moved) { $('#imgview').classList.add('dragging'); IV.tx = pan.tx + dx; IV.ty = pan.ty + dy; imgApply(); }
   } else if (BX.drag) {
     if (BX.drag.kind === 'grid') gridDrag(BX.drag, p);
+    else if (BX.drag.kind === 'gnear') gridNearDrag(BX.drag, p);
     else if (BX.drag.kind === 'gframe') gridFrameDrag(BX.drag, p);
     else if (BX.drag.kind === 'polyclick') { if (dist(p, BX.drag.start) * IV.scale > 6) BX.drag.moved = true; }
     else if (BX.drag.kind === 'band') bandMove(BX.drag, p);
@@ -1614,10 +1754,11 @@ $('#imgview').addEventListener('pointermove', e => {
   drawGuide();
 });
 $('#imgview').addEventListener('pointerenter', () => { IV.hover = true; });
-$('#imgview').addEventListener('pointerleave', () => { IV.hover = false; IV.guideY = null; BX.cross = null; setHover(-1); drawGuide(); });
+$('#imgview').addEventListener('pointerleave', () => { IV.hover = false; IV.guideY = null; BX.cross = null; setHover(-1); drawGuide(); if (BX.grid && !BX.drag) gridHot(null); });
 $('#imgview').addEventListener('pointerup', e => {
   $('#imgview').classList.remove('dragging');
   if (pan) {
+    if (!pan.moved && pan.gdel && BX.grid) { const t = gridDelTarget(imgPt(e)); if (t) gridLineDel(t.ax, t.i); else toast('Click on a line to remove it (Esc: done removing).', 2500); }
     if (!pan.moved && pan.click) {
       const p = imgPt(e);
       const hit = boxAt(p);
@@ -1629,7 +1770,8 @@ $('#imgview').addEventListener('pointerup', e => {
   }
   if (BX.drag) {
     const d = BX.drag;
-    if (d.kind === 'grid') { BX.drag = null; if (d.moved) gridPush(d.orig); drawGrid(); }
+    if (d.kind === 'grid') { BX.drag = null; if (d.moved) gridPush(d.orig); BX.gSel = { ax: d.hit.ax, i: d.hit.i }; BX.gridHint = null; drawGrid(); renderBoxbar(); if (d.moved) gridLive(); }
+    else if (d.kind === 'gnear') { BX.drag = null; gridSelLine(null); }  // a click in the grid, not on a line
     else if (d.kind === 'gframe') gridFrameUp(d);
     else if (d.kind === 'polyclick') { BX.drag = null; if (!d.moved) polyClick(imgPt(e)); }
     else if (d.kind === 'band') bandUp(d, imgPt(e));
@@ -1646,6 +1788,302 @@ $('#imgview').addEventListener('dblclick', e => {
 });
 $('#imgview').addEventListener('pointercancel', () => { pan = null; if (BX.drag) { BX.drag = null; clearDraft(); drawBoxes(); drawOverlay(); } });
 $('#guide-on').addEventListener('change', () => { LS.set('guide', $('#guide-on').checked); drawGuide(); });
+$('#g-keep').addEventListener('change', () => { if (BX.grid && !BX.gridFresh && gridSteps() && !gridSizeDiffers()) { gridPush(); gridLive(); } });
+$('#g-moveall').checked = !!LS.get('gmoveall', false);
+$('#g-side-h').value = LS.get('gsideh', 'end') === 'start' ? 'start' : 'end';
+$('#g-side-v').value = LS.get('gsidev', 'end') === 'start' ? 'start' : 'end';
+$('#g-par').value = ['start', 'end'].includes(LS.get('gpar', '')) ? LS.get('gpar', '') : '';
+for (const [id, key] of [['#g-moveall', 'gmoveall'], ['#g-side-h', 'gsideh'], ['#g-side-v', 'gsidev'], ['#g-par', 'gpar']]) {
+  const el = $(id);
+  el.addEventListener('change', () => { LS.set(key, el.type === 'checkbox' ? el.checked : el.value); gridOptsMark(); });
+  el.addEventListener('keydown', e => { if (e.key === 'Escape') { e.preventDefault(); gridOpts(false); } e.stopPropagation(); });  // arrows and Enter here are not table keys
+}
+$('#g-keep').addEventListener('keydown', e => { if (e.key === 'Escape') { e.preventDefault(); gridOpts(false); } e.stopPropagation(); });
+$('#g-keep').addEventListener('change', gridOptsMark);
+/* Options ▾ of the grid bar: the settings one sets once, in a panel over the image. The button is blue when one of
+   them is not the usual one, so a setting left on is seen. */
+function gridOpts(open) {
+  const pop = $('#g-opts');
+  if (open) gridKeepNote(true);
+  pop.hidden = !open;
+  $('#g-optbtn').classList.toggle('open', !!open);
+  if (!open) $('#gridwrap').focus({ preventScroll: true });
+}
+function gridOptsMark() {
+  const on = $('#g-moveall').checked || $('#g-side-h').value === 'start' || $('#g-side-v').value === 'start' || !!$('#g-par').value || $('#g-keep').checked;
+  $('#g-optbtn').classList.toggle('on', on);
+  gridKeepNote();
+}
+/* Under "Keep the boxes I drew or fixed by hand": what it does now, with the number of such boxes in this table
+   (counted when the panel opens: unticking it can replace them at once). */
+function gridKeepNote(recount) {
+  const el = $('#g-keep-note');
+  if (!el || !S.model) return;  // (also at load, before BX exists)
+  if (recount || BX.keepN == null) BX.keepN = S.model.cells.filter(c => c.bbox && c.box_by === 'hand').length;
+  const n = BX.keepN, b = n === 1 ? 'box' : 'boxes';
+  el.textContent = !n ? 'No box of this table was drawn, moved or resized by hand yet, so this changes nothing for now.'
+    : $('#g-keep').checked ? `Your ${n} ${b} made by hand (drawn, moved or resized: “box ✓” above the image) stay as they are; the other cells get their box from the lines.`
+    : `The lines give every cell its box: your ${n} ${b} made by hand ${n === 1 ? 'is' : 'are'} replaced too (Ctrl+Z brings ${n === 1 ? 'it' : 'them'} back).`;
+}
+$('#g-opts-ok').addEventListener('click', () => gridOpts(false));
+document.addEventListener('pointerdown', e => { if (!$('#g-opts').hidden && !e.target.closest('#g-opts, #g-optbtn')) gridOpts(false); }, true);
+gridOptsMark();
+/* View mode: the boxes can be hidden, to see the page alone. */
+/* What is drawn on the image can be hidden, to see the page under it. View: "Show boxes" (remembered). Box mode and
+   the grid: "Show boxes" / "Show lines", hidden only for a while: it comes back when the grid opens or closes, box mode
+   changes or another table opens, so nothing stays hidden by mistake; while hidden, a drag on the image only moves it.
+   A key does the same in every mode (Ctrl+H, the annotator can choose another): a tap hides / shows, held down it
+   hides only while held. */
+function applyBoxVis() {
+  $('#overlay').classList.toggle('noboxes', !BX.on && !$('#boxes-on').checked);
+  $('#overlay').classList.toggle('nomarks', BX.on && !$('#marks-on').checked);
+  $('#marks-name').textContent = BX.grid ? 'Show lines' : 'Show boxes';
+  const k = keyNames('hide'), how = k ? ` (or ${k}; hold ${k}: hidden only while you hold it)` : '';
+  $('#boxes-lbl').title = `The cell boxes on the image. Untick${how} to see the page alone. Right-click: ⌨ Keys`;
+  $('#marks-lbl').title = `Untick${how} to see the page under the boxes and grid lines. Right-click: ⌨ Keys`;
+}
+const marksHidden = () => BX.on && !$('#marks-on').checked;
+function showMarks() { if (!$('#marks-on').checked) { $('#marks-on').checked = true; applyBoxVis(); } }
+$('#boxes-on').addEventListener('change', () => { LS.set('viewboxes', $('#boxes-on').checked); applyBoxVis(); });
+$('#marks-on').addEventListener('change', () => { applyBoxVis(); renderBoxbar(); $('#gridwrap').focus({ preventScroll: true }); });
+for (const id of ['#boxes-lbl', '#marks-lbl']) $(id).addEventListener('contextmenu', e => { e.preventDefault(); openKeys('hide'); });
+/* Keys. The basic keys are fixed (copy, paste, undo, redo, select all, save, moving and editing in the table); the
+   other actions have keys the annotator can change, remove or take from another action in ⌨ Keys (saved in this
+   browser). A key is { ctrl, alt, shift, key, label? }: key = the character typed, in lower case, or the name of the
+   key (Enter, F4, ArrowUp…). For a symbol (/ . , -), Shift is not looked at: some keyboards need it to type it. */
+const KEY_ACTIONS = [  // [id, group, what it does, default keys]
+  ['merge', 'Table', 'Merge the selected cells', [{ ctrl: true, key: 'm' }]],
+  ['split', 'Table', 'Split the merged cell', [{ ctrl: true, shift: true, key: 'm' }]],
+  ['row-above', 'Table', 'Insert a row above', [{ ctrl: true, shift: true, key: 'ArrowUp' }]],
+  ['row-below', 'Table', 'Insert a row below', [{ ctrl: true, shift: true, key: 'ArrowDown' }]],
+  ['col-left', 'Table', 'Insert a column to the left', [{ ctrl: true, shift: true, key: 'ArrowLeft' }]],
+  ['col-right', 'Table', 'Insert a column to the right', [{ ctrl: true, shift: true, key: 'ArrowRight' }]],
+  ['del', 'Table', 'Delete rows, columns or cells (then R, C, L or U)', [{ ctrl: true, key: '-' }]],
+  ['header', 'Table', 'Header on / off', [{ ctrl: true, key: 'b' }]],
+  ['unclear', 'Table', 'Unclear on / off', [{ ctrl: true, key: 'u' }]],
+  ['sup', 'Text', 'Superscript', [{ ctrl: true, key: '.' }]],
+  ['sub', 'Text', 'Subscript', [{ ctrl: true, key: ',' }]],
+  ['math', 'Text', 'Formula (LaTeX between $…$)', []],
+  ['symbols', 'Text', 'Open Ω Symbols', []],
+  ['replace', 'Text', 'Replace text in the selected cells (or the whole table)', [{ ctrl: true, shift: true, key: 'f' }]],
+  ['boxmode', 'Image and boxes', 'Box mode on / off', [{ ctrl: true, key: 'e' }]],
+  ['hide', 'Image and boxes', 'Hide / show the boxes and grid lines (held: only while held)', [{ ctrl: true, key: 'h' }]],
+  ['guide', 'Image and boxes', 'Row guide on / off (View)', []],
+  ['imgfit', 'Image and boxes', 'Whole image (Fit)', []],
+  ['imgwidth', 'Image and boxes', 'Image as wide as the pane (Width)', []],
+  ['zoomin', 'Image and boxes', 'Zoom in', []],
+  ['zoomout', 'Image and boxes', 'Zoom out', []],
+  ['boxfit', 'Image and boxes', 'Fit the box to the ink', []],
+  ['grid', 'Grid', 'Open / close the grid', []],
+  ['snap', 'Grid', 'Snap the lines onto the page', []],
+  ['even', 'Grid', 'Space the lines evenly', []],
+  ['gdel', 'Grid', 'Remove lines: click a line (on / off)', []],
+  ['done', 'Tables', 'This table is done: open the next one', [{ ctrl: true, key: 'Enter' }]],
+  ['next', 'Tables', 'Next table', [{ ctrl: true, alt: true, key: 'PageDown' }]],
+  ['prev', 'Tables', 'Previous table', [{ ctrl: true, alt: true, key: 'PageUp' }]],
+  ['help', 'Tables', 'Help', [{ ctrl: true, key: '/' }]],
+];
+const KEY_FIXED = [
+  ['Ctrl+C · Ctrl+X · Ctrl+V', 'Copy, cut, paste'], ['Ctrl+Z', 'Undo'], ['Ctrl+Y · Ctrl+Shift+Z', 'Redo'],
+  ['Ctrl+A', 'Select the whole table'], ['Ctrl+S', 'Save now'],
+  ['↑ ↓ ← → · Tab · Enter · F2 · Esc · Delete', 'Move, edit, clear'],
+  ['Shift+↑↓←→ · Shift+Space · Ctrl+Space', 'Select cells, rows, columns'],
+  ['Ctrl+↑↓←→ · Ctrl+Home · Ctrl+End · PageUp · PageDown', 'Jump in the table'],
+  ['Alt+1…9', 'Your first nine symbols'], ['Space+drag', 'Move the image (box mode)'],
+];
+const KEY_DEF = Object.fromEntries(KEY_ACTIONS.map(a => [a[0], a[3]]));
+const KEY_TITLE = Object.fromEntries(KEY_ACTIONS.map(a => [a[0], a[2]]));
+const KEY_LABEL = { ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→', ' ': 'Space', '-': '−' };
+let KM = null, KEYTXT = null;
+function keymap() {
+  if (KM) return KM;
+  const saved = LS.get('keymap', null) || {};
+  KM = {};
+  for (const [id, , , d] of KEY_ACTIONS) KM[id] = Array.isArray(saved[id]) ? saved[id] : d;
+  return KM;
+}
+function setKeys(id, list) { const saved = LS.get('keymap', null) || {}; saved[id] = list; LS.set('keymap', saved); KM = null; KEYTXT = null; keysChanged(); }
+function resetKeys() { LS.set('keymap', null); KM = null; KEYTXT = null; keysChanged(); }
+function keysChanged() { applyKeyTitles(); applyBoxVis(); renderBoxbar(); renderHelp(); }
+const keyLabel = b => b.label || KEY_LABEL[b.key] || (b.key.length === 1 ? b.key.toUpperCase() : b.key);
+const keyName = b => (b ? [b.ctrl && 'Ctrl', b.alt && 'Alt', b.shift && 'Shift', keyLabel(b)].filter(Boolean).join('+') : '');
+const keysOf = id => keymap()[id] || [];
+const keyNames = id => keysOf(id).map(keyName).join(' or ');
+const isSymbolKey = k => k.length === 1 && !/[\p{L}\p{N}]/u.test(k);
+const eKey = e => (e.key.length === 1 ? e.key.toLowerCase() : e.key);
+function keyMatches(b, e) {
+  if (!!(e.ctrlKey || e.metaKey) !== !!b.ctrl || e.altKey !== !!b.alt || eKey(e) !== b.key) return false;
+  return b.shift ? e.shiftKey : (isSymbolKey(b.key) || !e.shiftKey);
+}
+const sameKey = (a, b) => !!a.ctrl === !!b.ctrl && !!a.alt === !!b.alt && a.key === b.key && (isSymbolKey(a.key) || !!a.shift === !!b.shift);
+function keyAction(e) { const m = keymap(); for (const id in m) if (m[id].some(b => keyMatches(b, e))) return id; return null; }
+function keyFromEvent(e) {
+  const key = eKey(e), b = { ctrl: e.ctrlKey || e.metaKey, alt: e.altKey, shift: isSymbolKey(key) ? false : e.shiftKey, key };
+  if (e.altKey && !/^[\p{L}\p{N}]$/u.test(key) && /^(Key|Digit)/.test(e.code)) b.label = e.code.replace(/^(Key|Digit)/, '');  // Alt+B typing ∫ on a Mac
+  return b;
+}
+/* Why a key cannot be given to an action: it types in the table, it is a basic key, or the browser uses it. */
+function keyProblem(b) {
+  const k = b.key, name = keyName(b), plain = !b.ctrl && !b.alt, ch = k.length === 1 ? k : '';
+  if (plain && ch) return `${name}: a key alone types in the table. Add Ctrl or Alt.`;
+  if (plain && /^(Enter|Tab|Escape|Backspace|Delete|Home|End|PageUp|PageDown|ArrowUp|ArrowDown|ArrowLeft|ArrowRight|F2|Insert|ContextMenu)$/.test(k)) return `${name} moves or edits in the table: it stays as it is.`;
+  if (/^F(1|3|5|6|7|11|12)$/.test(k)) return `${name} is a key of the browser.`;
+  if (b.ctrl && b.alt && ch) return 'Ctrl+Alt with a key types special characters on many keyboards (AltGr): choose another.';
+  if (b.alt && !b.ctrl && /^\d$/.test(ch)) return 'Alt+1…9 put your symbols in the cell: they stay as they are.';
+  if (!b.ctrl && b.shift && k === ' ') return 'Shift+Space selects rows: it stays as it is.';
+  if (b.ctrl && !b.alt) {
+    const fixed = b.shift ? { z: 'redo', ' ': 'select columns' } : { z: 'undo', y: 'redo', a: 'select all', s: 'save', c: 'copy', x: 'cut', v: 'paste', ' ': 'select columns' };
+    if (fixed[ch]) return `${name} is a basic key (${fixed[ch]}): it cannot be changed.`;
+    if (!b.shift && /^(Arrow|Home$|End$)/.test(k)) return `${name} jumps in the table: it stays as it is.`;
+    const browser = b.shift ? { t: 'reopen a tab', n: 'private window', w: 'close the window', i: 'developer tools', j: 'developer tools', c: 'developer tools', r: 'reload', delete: 'clear the history', tab: 'previous tab' }
+      : { w: 'close the tab', t: 'new tab', n: 'new window', r: 'reload', l: 'address bar', f: 'find', p: 'print', q: 'quit', d: 'bookmark', o: 'open a file', j: 'downloads', k: 'search', g: 'find next', '+': 'zoom', '=': 'zoom', 0: 'zoom', tab: 'next tab', pageup: 'previous tab', pagedown: 'next tab' };
+    const w = browser[k.toLowerCase()] || (/^\d$/.test(ch) ? 'go to a tab' : '');
+    if (w) return `${name} is the browser's (${w}).`;
+  }
+  return '';
+}
+/* The texts of the tool name the usual keys: those of an action whose key was changed are replaced by its key now. */
+function keyText(s) {
+  if (typeof s !== 'string' || !s) return s;
+  if (KEYTXT === null) {
+    const m = keymap();
+    KEYTXT = [];
+    for (const [id, , , d] of KEY_ACTIONS) if (JSON.stringify(m[id]) !== JSON.stringify(d))
+      for (const b of d) for (const n of new Set([keyName(b), keyName(b).replace('−', '-')]))
+        KEYTXT.push([new RegExp(n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![A-Za-z0-9])', 'g'), id]);
+  }
+  if (!KEYTXT.length) return s;
+  for (const [re, id] of KEYTXT) s = s.replace(re, `\u0001${id}\u0002`);
+  return s.replace(/\u0001([\w-]+)\u0002/g, (_, id) => keyNames(id) || 'no key');
+}
+function applyKeyTitles() {
+  for (const el of $$('[title]')) {
+    if (el.id === 'boxes-lbl' || el.id === 'marks-lbl') continue;
+    if (el.dataset.t0 === undefined) { if (!/Ctrl\+|Alt\+/.test(el.title)) continue; el.dataset.t0 = el.title; }
+    el.title = keyText(el.dataset.t0);
+  }
+  const d = $('#btn-done kbd'); if (d) { d.textContent = keyNames('done'); d.hidden = !keysOf('done').length; }
+}
+/* Run an action from its key. */
+function runKeyAction(act) {
+  const click = sel => { const b = $(sel); if (b && !b.disabled && b.offsetParent !== null) { b.click(); return true; } return false; };
+  switch (act) {
+    case 'merge': case 'split': case 'header': case 'unclear': return apply(act, OPS[act]);
+    case 'row-above': case 'row-below': case 'col-left': case 'col-right': return apply('insert', OPS[act]);
+    case 'del': return askDelete();
+    case 'sup': case 'sub': case 'math': return wrapRich(act);
+    case 'symbols': return click('#sym-btn') || toast('Ω Symbols is not shown here.');
+    case 'replace': return replaceDialog();
+    case 'boxmode': if (boxPolicy() !== 'off') setBoxMode(!BX.on); return;
+    case 'hide': return toggleMarks();
+    case 'guide': return click('#guide-on') || toast('The row guide is in View (Ctrl+E switches).');
+    case 'imgfit': return click('[data-img="fit"]');
+    case 'imgwidth': return click('[data-img="width"]');
+    case 'zoomin': return click('[data-img="in"]');
+    case 'zoomout': return click('[data-img="out"]');
+    case 'boxfit': return BX.on && !BX.grid ? runOp('box-fit') : toast('Fit to ink: in box mode (Ctrl+E), with the grid closed.');
+    case 'grid': if (BX.grid) return closeGrid('done'); if (boxPolicy() === 'off') return; return openGrid();
+    case 'snap': case 'even': return click(`#bx-gridbar [data-g="${act}"]`) || toast('Open the grid first, and draw its outline.');
+    case 'gdel': return BX.grid && !BX.gridFresh ? gridTool(BX.gTool === 'del' ? null : 'del') : toast('Open the grid first, and draw its outline.');
+    case 'done': return markDone();
+    case 'next': return goRelative(1);
+    case 'prev': return goRelative(-1);
+    case 'help': return helpToggle();
+  }
+}
+/* Hide / show the boxes and grid lines: a tap switches, held down they are hidden only while held. */
+const hideKey = () => keysOf('hide')[0] || null;
+const hideHow = (what) => { const k = keyNames('hide'); return k ? `${k} or tick "${what}"` : `tick "${what}"`; };
+const HK = { down: null };
+function toggleMarks() {
+  if (!S.model) return;
+  const el = BX.on ? $('#marks-on') : $('#boxes-on');
+  el.checked = !el.checked;
+  if (BX.on) { applyBoxVis(); renderBoxbar(); } else { LS.set('viewboxes', el.checked); applyBoxVis(); }
+}
+function hideKeyUp(e) {  // the key, or one of its modifiers, let go: a long press only hid them while held
+  const d = HK.down;
+  if (!d) return;
+  const b = d.b || {};
+  if (!(e.type === 'blur' || eKey(e) === b.key || (b.ctrl && (e.key === 'Control' || e.key === 'Meta')) || (b.alt && e.key === 'Alt') || (b.shift && e.key === 'Shift'))) return;
+  if (Date.now() - d.t > 350) toggleMarks();
+  HK.down = null;
+}
+window.addEventListener('blur', hideKeyUp);
+function migrateHideKey() {  // a key chosen with the first version (only for hiding)
+  const old = LS.get('hidekey', null);
+  if (!old || !old.label) return;
+  const saved = LS.get('keymap', null) || {};
+  if (!saved.hide) setKeys('hide', [{ ctrl: !!old.ctrl, alt: !!old.alt, shift: !!old.shift, key: old.label.length === 1 ? old.label.toLowerCase() : old.label }]);
+  LS.set('hidekey', null);
+}
+/* ⌨ Keys: every action with its key; Change (then press the key), Remove, ↺ back to the usual key. A key another
+   action has: "Take it" gives it to this one, the other is left without a key. */
+function openKeys(focus) {
+  const K = { cap: null, pend: null, msg: '' };
+  const groups = [...new Set(KEY_ACTIONS.map(a => a[1]))];
+  const render = () => {
+    const m = keymap();
+    $('#ky-body').innerHTML = groups.map(gname => `<tr class="ky-g"><th colspan="3">${esc(gname)}</th></tr>` + KEY_ACTIONS.filter(a => a[1] === gname).map(([id, , title, d]) => {
+      const changed = JSON.stringify(m[id]) !== JSON.stringify(d);
+      const now = m[id].length ? m[id].map(b => `<kbd>${esc(keyName(b))}</kbd>`).join(' ') : '<span class="muted">—</span>';
+      let right;
+      if (K.cap === id && K.pend) right = `<td colspan="2" class="ky-cap"><b>${esc(keyName(K.pend.b))}</b> is the key of “${esc(KEY_TITLE[K.pend.from])}”. <button id="ky-take" class="primary">Take it</button> <button id="ky-cancel">Cancel</button><div class="muted">“${esc(KEY_TITLE[K.pend.from])}” is then left without this key. Enter: take it · another key: try that one · Esc: cancel</div></td>`;
+      else if (K.cap === id) right = `<td colspan="2" class="ky-cap">Press the new key… <button id="ky-cancel">Cancel</button><div id="ky-msg" class="${K.msg ? 'bad' : 'muted'}">${esc(K.msg || 'With Ctrl, Alt or Shift if you like. Esc: cancel.')}</div></td>`;
+      else right = `<td>${now}</td><td class="ky-btns"><button data-ky="set" data-id="${id}">${m[id].length ? 'Change' : 'Set'}</button><button data-ky="del" data-id="${id}"${m[id].length ? '' : ' disabled'} title="Leave this action without a key">Remove</button><button data-ky="def" data-id="${id}"${changed ? '' : ' disabled'} title="Back to the usual key: ${esc(d.map(keyName).join(' or ') || 'none')}">↺</button></td>`;
+      return `<tr data-id="${id}"${id === focus ? ' class="ky-focus"' : ''}><td>${esc(title)}</td>${right}</tr>`;
+    }).join('')).join('') + '<tr class="ky-g"><th colspan="3">Basic keys: they stay as they are</th></tr>'
+      + KEY_FIXED.map(([k, t]) => `<tr class="ky-fixed"><td>${esc(t)}</td><td colspan="2"><kbd>${esc(k)}</kbd></td></tr>`).join('');
+    const c = $('#ky-body .ky-cap') || (focus && $(`#ky-body tr[data-id="${focus}"]`));
+    if (c) c.scrollIntoView({ block: 'nearest' });
+  };
+  const take = () => {
+    const { from, list } = K.pend;
+    setKeys(from, keymap()[from].filter(x => !list.some(y => sameKey(x, y))));
+    setKeys(K.cap, list);
+    toast(`${list.map(keyName).join(' or ')}: ${KEY_TITLE[K.cap]}. “${KEY_TITLE[from]}” ${keysOf(from).length ? 'keeps ' + keyNames(from) : 'has no key now'}.`, 4000);
+    K.cap = null; K.pend = null; render();
+  };
+  openModal(`<h2>⌨ Keys</h2>
+    <p class="muted">The key of each action: change it, remove it, or take a key that another action has (that action is then left without it). Copy, paste, undo and moving in the table stay as they are. Saved in this browser.</p>
+    <div class="ky-wrap"><table class="ky"><tbody id="ky-body"></tbody></table></div>
+    <div class="actions"><button id="ky-reset">All back to the usual keys</button><span class="spacer"></span><button class="primary" data-close>Close</button></div>`, {
+    wide: true,
+    onClose: () => { $('#modal').onclick = null; },
+    onKey: e => {
+      if (!K.cap) return false;  // Esc closes the window
+      if (['Control', 'Alt', 'Shift', 'Meta', 'AltGraph', 'CapsLock', 'OS'].includes(e.key)) return true;
+      e.preventDefault(); e.stopPropagation();
+      if (e.key === 'Escape') { K.cap = null; K.pend = null; K.msg = ''; render(); return true; }
+      if (K.pend && e.key === 'Enter' && !e.ctrlKey && !e.altKey && !e.shiftKey) { take(); return true; }
+      K.pend = null;  // another key pressed instead: that one is looked at
+      const b = keyFromEvent(e), bad = keyProblem(b);
+      if (bad) { K.msg = bad; render(); return true; }
+      const m = keymap(), other = Object.keys(m).find(id => id !== K.cap && m[id].some(x => sameKey(x, b)));
+      if (other) { K.pend = { b, from: other, list: [b] }; render(); return true; }
+      setKeys(K.cap, [b]); K.cap = null; K.msg = ''; render();
+      return true;
+    },
+  });
+  $('#modal').onclick = ev => {
+    const t = ev.target.closest('button');
+    if (!t) return;
+    if (t.id === 'ky-take') return take();
+    if (t.id === 'ky-cancel') { K.cap = null; K.pend = null; K.msg = ''; return render(); }
+    if (t.id === 'ky-reset') { resetKeys(); K.cap = null; K.pend = null; toast('The usual keys again.', 2500); return render(); }
+    const id = t.dataset.id;
+    if (!id || !t.dataset.ky) return;
+    if (t.dataset.ky === 'set') { K.cap = id; K.pend = null; K.msg = ''; render(); }
+    else if (t.dataset.ky === 'del') { setKeys(id, []); render(); }
+    else if (t.dataset.ky === 'def') {
+      const d = KEY_DEF[id], m = keymap(), other = Object.keys(m).find(o => o !== id && m[o].some(x => d.some(y => sameKey(x, y))));
+      if (other) { K.cap = id; K.pend = { b: d.find(y => m[other].some(x => sameKey(x, y))), from: other, list: d }; }
+      else setKeys(id, d);
+      render();
+    }
+  };
+  render();
+}
 function drawGuide() {
   const svg = $('#overlay');
   $$('.guide-hover, .guide-pin, .cross', svg).forEach(n => n.remove());
@@ -2349,7 +2787,18 @@ function nextNeedingBox(from) {
 function boxHover(p, e) {
   let cur = 'crosshair';
   if (BX.space) cur = 'grab';
-  else if (BX.grid) { const h = gridHit(p); cur = !h ? 'grab' : h.end !== null ? 'move' : h.ax === 'h' ? 'ns-resize' : 'ew-resize'; gridHot(h); }
+  else if (BX.grid && BX.gTool === 'del' && !BX.gridFresh) {
+    const t = gridDelTarget(p);
+    cur = t ? 'pointer' : 'grab';
+    const key = t ? 'x' + t.ax + t.i : null, hint = t ? `Click: remove the ${gridLineName(t.ax, t.i).replace(/^[A-Z]/, ch => ch.toLowerCase())}${gridDelWhat(t.ax, t.i)} · the other lines stay` : null;
+    if (key !== BX.gridHotKey) { BX.gridHotKey = key; drawGrid(); }
+    if (hint !== BX.gridHint) { BX.gridHint = hint; renderBoxbar(); }
+  }
+  else if (BX.grid) {
+    const h = BX.gridFresh ? null : gridHit(p), inside = !h && !BX.gridFresh && gridInside(p);
+    cur = h ? (h.end !== null ? 'move' : h.ax === 'h' ? 'ns-resize' : 'ew-resize') : inside ? 'move' : BX.gridFresh ? 'crosshair' : 'grab';
+    gridHot(h, p, inside);
+  }
   else { const c = BX.none ? null : S.model.cells[activeIndex()]; cur = hitCursor(c && c.bbox ? boxHit(c, p) : null); }
   if (BX.shape === 'select' && !BX.grid && !BX.space) {
     const mi = multiIdx(), j = boxAt(p);
@@ -2382,26 +2831,45 @@ function setBoxMode(on) {
   if (boxPolicy() === 'off') on = false;
   BX.none = false;
   if (!on) { endAssign(); polyCancel(); }
-  if (!on && BX.grid) closeGrid(false);
+  if (!on && BX.grid) closeGrid('keep');
   const was = BX.on;
   BX.on = !!on;
+  if (was !== BX.on) $('#marks-on').checked = true;
   LS.set('boxmode', BX.on);
-  if (was !== BX.on && IV.w) { applyLayout(); imgFit(LS.get('imgfit', 'width')); }
+  if (was !== BX.on && IV.w) imgKeepView(applyLayout);
   $('#imgpane').classList.toggle('boxmode', BX.on);
   $('#grid').classList.toggle('boxmode', BX.on);
   $$('#imgpane [data-mode]').forEach(b => b.classList.toggle('on', (b.dataset.mode === 'boxes') === BX.on));
   $('#boxbar').hidden = !BX.on;
+  applyBoxVis();
   $('#imgview').style.cursor = '';
   setHover(-1);
   drawGuide(); drawOverlay();
   if (S.model) renderCellbar();
   renderBoxbar();
 }
+/* The hint at the bottom of the image: shown when it changes, faded after 6 s, and hidden while the pointer is near
+   it, so it never covers the page for long. */
+let HINT = { text: '', timer: 0 };
+function hintShown() {
+  const el = $('#img-hint');
+  if (el.textContent === HINT.text) return;
+  HINT.text = el.textContent;
+  el.classList.remove('faded');
+  clearTimeout(HINT.timer);
+  HINT.timer = setTimeout(() => el.classList.add('faded'), 6000);
+}
+$('#imgview').addEventListener('pointermove', e => {
+  const el = $('#img-hint'), r = el.getBoundingClientRect();
+  el.classList.toggle('away', e.clientY > r.top - 30 && e.clientX < r.right + 30);
+});
+$('#imgview').addEventListener('pointerleave', () => $('#img-hint').classList.remove('away'));
 function renderBoxbar() {
   if (!S.model) return;
   $('#mode-seg').hidden = boxPolicy() === 'off';
   const c = S.model.cells[activeIndex()];
   $('#img-hint').textContent = !BX.on ? 'Wheel: scroll · Ctrl+wheel: zoom · drag: move · click: pin row guide'
+    : marksHidden() ? `The ${BX.grid ? 'grid lines' : 'boxes'} are hidden to see the page: ${hideHow(BX.grid ? 'Show lines' : 'Show boxes')} brings them back · drag: move the image`
     : BX.assign !== null ? `Type the cell the box of ${cellRef(S.model.cells[BX.assign])} belongs to (e.g. E5), or click it in the table (or click another box) · Esc: cancel`
     : BX.poly ? `Polygon of ${BX.poly.idx < 0 ? 'a new box (it goes to the cell at that place)' : cellRef(S.model.cells[BX.poly.idx])}: click the next point · click the first point, double-click or Enter: close it · Backspace: remove the last point · Esc: cancel`
     : BX.none && !BX.grid ? (BX.shape === 'select' ? 'Nothing selected · click a box: select it · drag a rectangle: select the boxes it touches · to add boxes, switch to ▭ Box or ⬠ Polygon: a new box goes to the cell at that place, no box is replaced · Space+drag: move the image'
@@ -2411,8 +2879,12 @@ function renderBoxbar() {
       : `Click a box: select it, then drag it to move it · click an empty spot or Esc: nothing selected (to add boxes) · drag a rectangle: select the boxes it touches (Ctrl: add) · Ctrl+click: add / take out a box · drag a side of the selected box: resize · right-click a box: more · Space+drag: move the image`)
     : BX.shape === 'poly' && !BX.grid ? `Click the points of the polygon of ${cellRef(c)} · double-click a point of a polygon: remove it, an edge: add a point · choose the cell in the table`
     : BX.grid ? (BX.gridFresh ? 'Drag a rectangle around the table: the lines are spread inside it · Space+drag: move the image'
-      : 'Drag the outer border: the inner lines follow (Alt: border alone) · drag a line: move it · drag a round end: tilt it (corner: sideways tilts the left/right border, up/down the top/bottom) · Shift+drag: new outline · Space+drag: move the image')
+      : BX.gTool === 'del' ? (BX.gridHint || 'Remove lines: click a line (it turns red and dashed) to remove it; the other lines stay where they are · a border too: the next line becomes the border · drag: move the image · Esc or ✕ Remove lines: done')
+      : BX.gridHint || (BX.gSel ? `${gridLineName(BX.gSel.ax, BX.gSel.i)} selected: ${BX.gSel.ax === 'h' ? '↑ ↓' : '← →'} move it a little (Shift: more) · drag any line to move it · click an empty spot: unselect`
+        : 'Drag a line, or anywhere near it: up or down moves the nearest row line, left or right the nearest column line · drag a round end: tilt it · click a line, then the arrow keys move it a little · Shift+drag: new outline · Space+drag: move the image'))
     : `Drag: draw the box of ${cellRef(c)} · drag its edges or inside: adjust (a shared border moves for both cells; Alt+drag: this box alone) · click a box: select its cell, Shift+click: add it (then Merge), Ctrl+click or Ctrl+drag: select several boxes · right-click a box: more · Space+drag: move the image`;
+  $('#img-hint').textContent = keyText($('#img-hint').textContent);
+  hintShown();
   if (!BX.on) return;
   $('#bx-regrid').hidden = !!BX.grid || !gridOK(S.meta.grid_lines);
   const want = S.model.cells.filter(x => boxPolicy() === 'text' ? !!x.text : true);
@@ -2562,7 +3034,7 @@ function gridFromBoxes() {
   return { h: H.map(y => [y, y]), v: V.map(x => [x, x]) };
 }
 /* How the grid starts: 'saved' (the lines kept for this table), 'boxes' (from the boxes the cells have,
-   e.g. the model output) or 'uniform' (rows and columns of equal size, placed by hand). */
+   the model's or drawn by hand) or 'uniform' (rows and columns of equal size, placed by hand). */
 function gridStart(mode) {
   const saved = gridOK(S.meta.grid_lines) ? cloneGrid(S.meta.grid_lines) : null;
   if (mode === 'saved' && saved) return { g: saved, fresh: false };
@@ -2582,7 +3054,7 @@ function gridMenu(x, y) {
   const saved = gridOK(S.meta.grid_lines), boxes = S.model.cells.some(c => c.bbox), open = !!BX.grid;
   const items = [];
   if (saved) items.push(['grid:saved', open ? 'Back to the lines saved for this table' : 'Back to the grid these boxes were made from', '']);
-  items.push(boxes ? ['grid:boxes', 'Lines from the cell boxes (model output)', ''] : ['', 'Lines from the cell boxes: no cell has a box yet', '']);
+  items.push(boxes ? ['grid:boxes', 'Lines from the cell boxes (the model’s or drawn by hand)', ''] : ['', 'Lines from the cell boxes: no cell has a box yet', '']);
   items.push(['grid:uniform', 'Uniform grid: equal rows and columns, you move the lines', '']);
   items.push(['grid:size', 'Uniform grid of another size: choose rows × columns…', '']);
   showMenuItems(x, y, items);
@@ -2591,24 +3063,26 @@ function gridOp(mode) {
   if (!IV.w || !S.model) return;
   if (mode === 'size') {  // a uniform grid, then the cursor in the rows field
     gridOp('uniform');
+    BX.sizeEven = true;  // the size fields spread this uniform grid evenly, until a line is placed some other way
     setTimeout(() => { const el = $('#g-rows'); el.focus(); el.select(); }, 0);
     toast('Type the number of rows and of columns of the grid (Tab between them, Enter).', 5000);
     return;
   }
   LS.set('gridstart', mode);
   if (!BX.grid) return openGrid(mode);
-  gridPush();  // already open: start over (Ctrl+Z goes back)
+  gridPush(); BX.gSel = null;  // already open: start over (Ctrl+Z goes back)
   const st = gridStart(mode);
   BX.grid = st.g; BX.gridFresh = st.fresh;
   drawGrid(); renderBoxbar();
   gridToast(mode, st);
+  gridLive();
 }
 function gridToast(mode, st) {
   if (st.fresh) toast('Drag a rectangle around the table first: the lines are spread inside it.', 5000);
   else if (mode === 'uniform') toast(st.outline ? 'Uniform grid over the table area. Move the lines by hand (Snap puts them on the lines of the page).'
     : 'Uniform grid over the image. Shift+drag a rectangle around the table (or drag each outer border), then move the lines by hand.', 6000);
-  else if (mode === 'boxes') toast('Lines placed from the boxes the cells have. Drag the outer border: the inner lines follow.', 5000);
-  else if (mode === 'saved') toast('Back to the grid these boxes were made from. Move the lines, then Make boxes' + ($('#g-keep').checked ? ': the boxes you fixed by hand are kept ("keep my boxes").' : '.'), 6000);
+  else if (mode === 'boxes') toast('Lines placed from the boxes the cells have. Move a line: the boxes follow. Right-click on the image: add a line there · ✕ Remove lines: click the lines to remove.', 6000);
+  else if (mode === 'saved') toast('Back to the grid these boxes were made from. Move the lines: the boxes follow' + ($('#g-keep').checked ? ' (the boxes you drew or fixed by hand stay: Options ▾, "Keep the boxes I drew or fixed by hand").' : '.'), 6000);
 }
 function openGrid(mode, lines) {
   if (!IV.w || !S.model) return;
@@ -2617,75 +3091,433 @@ function openGrid(mode, lines) {
   const st = lines ? { g: cloneGrid(lines), fresh: false } : gridStart(mode);
   BX.grid = st.g;
   BX.gridFresh = st.fresh;
-  BX.gUndo = []; BX.gRedo = [];
+  BX.gs = (BX.gs || 0) + 1; BX.gCounted = false; BX.partial = {}; BX.askedFewer = false; BX.gSel = null; BX.gridHint = null; BX.gTool = null; gridToolUI();
+  BX.gridStartLines = S.meta.grid_lines;
   const m = S.model;
-  $('#g-keep').checked = S.model.cells.some(c => c.bbox && c.box_by === 'hand');
+  $('#g-keep').checked = S.model.cells.some(c => c.bbox && c.box_by === 'hand'); BX.keepN = null; gridOptsMark();
   $('#bx-normal').hidden = true; $('#bx-gridbar').hidden = false;
+  $('#marks-on').checked = true; applyBoxVis();
   drawBoxes(); drawOverlay(); drawGrid(); drawGuide(); renderBoxbar();
   $('#overlay').classList.add('gridding');
   gridToast(mode || (gridOK(S.meta.grid_lines) ? 'saved' : 'boxes'), st);
 }
-function closeGrid(applyIt) {
+/* Close the grid. how: 'done' (Close grid, Enter: the boxes made from the lines stay; a grid of another size than the table
+   asks to resize the table first), 'keep' (Esc, box mode off: the same, without asking; lines of another size are not
+   used), 'cancel' (the boxes as they were when the grid was opened; Ctrl+Y brings the others back), 'drop' (another
+   table is opened). */
+function closeGrid(how = 'keep') {
   if (!BX.grid) return;
-  if (applyIt && BX.gridFresh) return toast('Drag a rectangle around the table first.');
-  if (applyIt && gridSizeDiffers()) return gridResizeDialog();  // the grid stays open until confirmed
-  if (applyIt) gridApply();
-  BX.grid = null; BX.drag = null;
+  if (!$('#g-opts').hidden) gridOpts(false);
+  const fit = gridFit(), differs = !BX.gridFresh && gridSizeDiffers() && !fit, steps = gridSteps();
+  if (how === 'done' && differs) return gridDiff().fewer.length ? gridFewerDialog() : gridResizeDialog();  // the grid stays open until confirmed
+  if (how === 'cancel' && steps) gridCancel();
+  else {
+    gridCollapse();
+    const t = S.undo[S.undo.length - 1];
+    if (how !== 'drop' && how !== 'cancel' && steps) {
+      if (t && t.gs === BX.gs && t.gtag) BX.lastGrid = { snap: t, g: cloneGrid(BX.grid) };
+      if (!differs) toast(fit && (fit.h || fit.v || gridSizeDiffers()) ? `Grid closed. The boxes follow its lines; ${gridDiff().fewer.map(ax => gridFitText(ax).none).join(' and ')} have no box yet (Done lists them). ▦ Back to grid (or Ctrl+Z) opens the lines again.`
+        : 'Grid closed. The boxes follow its lines and are saved; drag the edges of a box to adjust it. ▦ Back to grid (or Ctrl+Z) opens the lines again.', 5000);
+    }
+  }
+  if (how === 'keep' && differs) toast(`The grid (${BX.grid.h.length - 1} × ${BX.grid.v.length - 1}) is not the size of the table (${S.model.nRows} × ${S.model.nCols}): its lines were not used${steps ? '; the boxes keep the last lines that matched' : ''}.`, 6000);
+  BX.grid = null; BX.drag = null; BX.sizeEven = false; BX.partial = {}; BX.gSel = null; BX.gridHint = null; BX.gridHotKey = null; BX.gTool = null; gridToolUI();
   $('#bx-normal').hidden = false; $('#bx-gridbar').hidden = true;
+  $('#marks-on').checked = true; applyBoxVis();
   $('#overlay').classList.remove('gridding');
   drawGrid(); drawOverlay(); drawGuide(); renderBoxbar();
   $('#imgview').style.cursor = '';
 }
-/* The number of rows and columns of the grid. Another size than the table's: Make boxes resizes the table
-   (rows added or removed at the bottom, columns at the right) after asking. */
+/* The number of rows and columns of the grid. Another size than the table's: the boxes wait, and Close grid resizes the
+   table (rows added or removed at the side chosen in the grid bar: bottom or top, right or left) after asking. */
 const gridSizeDiffers = () => !!BX.grid && (BX.grid.h.length - 1 !== S.model.nRows || BX.grid.v.length - 1 !== S.model.nCols);
+/* Rows (h) and columns (v) the grid has fewer of than the table, and more of. */
+function gridDiff() {
+  const g = BX.grid, m = S.model, out = { fewer: [], more: [] };
+  if (!g) return out;
+  for (const ax of ['h', 'v']) {
+    const ng = g[ax].length - 1, nt = ax === 'h' ? m.nRows : m.nCols;
+    if (ng < nt) out.fewer.push(ax); else if (ng > nt) out.more.push(ax);
+  }
+  return out;
+}
+/* How the grid gives the boxes: the offset of its first row and column in the table, or null when the boxes wait
+   (a grid with more rows or columns than the table; fewer, until "keep the table" is chosen). With fewer, the rows
+   the grid lacks are at the side chosen in the grid bar ("rows at"): their cells get no box. */
+function gridFit() {
+  const g = BX.grid, m = S.model;
+  if (!g || BX.gridFresh) return null;
+  const off = {};
+  for (const ax of ['h', 'v']) {
+    const ng = g[ax].length - 1, nt = ax === 'h' ? m.nRows : m.nCols;
+    if (ng === nt) off[ax] = 0;
+    else if (ng < nt && BX.partial && BX.partial[ax]) off[ax] = gridSide(ax) ? nt - ng : 0;
+    else return null;
+  }
+  return off;
+}
+/* The rows (columns) of the table the grid gives boxes to, and those left without, as text. */
+function gridFitText(ax) {
+  const ng = BX.grid[ax].length - 1, nt = ax === 'h' ? S.model.nRows : S.model.nCols, d = nt - ng, start = gridSide(ax);
+  const nm = ax === 'h' ? (k => String(k + 1)) : colName, span = (a, b) => (b > a ? `${nm(a)}–${nm(b)}` : nm(a));
+  const w = ax === 'h' ? ['row', 'rows'] : ['column', 'columns'];
+  const have = start ? span(d, nt - 1) : span(0, ng - 1), none = start ? span(0, d - 1) : span(ng, nt - 1);
+  return { have: `${w[1]} ${have}`, none: `${d > 1 ? w[1] : w[0]} ${none}` };
+}
 function renderGridSize() {
   const g = BX.grid;
   if (!g) return;
   for (const [id, v] of [['#g-rows', g.h.length - 1], ['#g-cols', g.v.length - 1]]) { const el = $(id); if (document.activeElement !== el) el.value = v; }
-  const diff = gridSizeDiffers();
+  const diff = gridSizeDiffers(), { fewer, more } = gridDiff(), m = S.model;
   $('#g-size').classList.toggle('diff', diff);
-  $('#g-tbl').textContent = diff ? `table ${S.model.nRows} × ${S.model.nCols}: Make boxes resizes it` : '';
+  const el = $('#g-tbl');
+  el.classList.toggle('ask', fewer.length > 0);
+  if (!diff || BX.gridFresh) { el.textContent = ''; return; }
+  if (!fewer.length) { el.textContent = `table ${m.nRows} × ${m.nCols}: the boxes follow when the sizes match (Close grid adds the ${more.map(ax => (ax === 'h' ? 'rows' : 'columns')).join(' and ')})`; return; }
+  const open = fewer.filter(ax => !(BX.partial && BX.partial[ax]));
+  const what = fewer.map(ax => (ax === 'h' ? 'rows' : 'columns')).join(' and ');
+  const kept = fewer.filter(ax => BX.partial && BX.partial[ax]).map(ax => { const t = gridFitText(ax); return `boxes for ${t.have}; ${t.none}: no box yet`; });
+  el.innerHTML = (open.length ? `The grid has fewer ${what} than the table (${m.nRows} × ${m.nCols}): <button data-g="gkeep" title="The table stays as it is. The ${what} the grid has get their boxes from the lines; the others get no box for now (Done lists the cells without a box)">Keep the table</button> `
+    : esc(kept.join(' · ')) + (more.length ? ' · the boxes wait: the grid has more ' + more.map(ax => (ax === 'h' ? 'rows' : 'columns')).join(' and ') : '') + ' ')
+    + `<button data-g="gmatch" title="Choose which ${what} of the table to delete or merge, so that the table has the size of the grid">Make the table match…</button>`;
+  if (open.length && !BX.askedFewer) { BX.askedFewer = true; toast(`The grid has fewer ${what} than the table. Choose in the grid bar: keep the table (boxes for the ${what} the grid has), or make the table match (you pick what to delete or merge).`, 7000); }
+}
+/* "Keep the table": the grid gives boxes to the rows (columns) it has; the others have none for now. A step of the history. */
+function gridKeepTable() {
+  const { fewer } = gridDiff();
+  if (!fewer.length) return;
+  gridPush();
+  BX.partial = Object.assign({}, BX.partial);
+  for (const ax of fewer) BX.partial[ax] = true;
+  if (!gridLive()) renderGridSize();
+  const t = fewer.map(gridFitText);
+  toast(`The table keeps its size. Boxes for ${t.map(x => x.have).join(' and ')}; ${t.map(x => x.none).join(' and ')} have no box for now: draw them, or Done lists them.`, 7000);
+}
+/* The number of rows and columns of the grid, from the fields. "move all lines": the inner lines are spread evenly
+   between the outer ones. Otherwise the lines stay where they are: a new row (column) goes outside the grid at the side
+   chosen in the grid bar, as high (wide) as the row there, or splits that row in two when the image has no room; a row
+   removed is the one at that side. When the grid had the size of the table, the table gets the same change at the
+   same side, so the boxes keep following: added rows or columns are empty; removed ones go only when they have no
+   text (with text, Close grid asks first). */
+const gridSide = ax => $(ax === 'h' ? '#g-side-h' : '#g-side-v').value === 'start';  // true: top / left
+/* The selection stays on its cells while rows / columns are added or removed elsewhere: map.row / map.col give the
+   new index of an old one. */
+function keepSel(sel0, map) {
+  const id = i => i, fr = map.row || id, fc = map.col || id;
+  return { ar: fr(sel0.ar), er: fr(sel0.er), ac: fc(sel0.ac), ec: fc(sel0.ec) };
+}
+const sideName = (ax, start) => (ax === 'h' ? (start ? 'top' : 'bottom') : (start ? 'left' : 'right'));
+/* The cells with text that lie wholly in the d rows ('h') or columns ('v') at one side of the table. */
+function edgeTextCells(ax, start, d) {
+  const m = S.model, row = ax === 'h', N = row ? m.nRows : m.nCols, lo = start ? 0 : N - d, hi = start ? d - 1 : N - 1;
+  return m.cells.filter(c => { const p = row ? c.r : c.c, s = row ? c.rs : c.cs; return c.text && p >= lo && p + s - 1 <= hi; });
 }
 function gridSetSize() {
   const g = BX.grid;
   if (!g) return;
   const val = id => clamp(Math.round(+$(id).value || 0), 1, 300);
-  const nr = val('#g-rows'), nc = val('#g-cols');
-  if (nr === g.h.length - 1 && nc === g.v.length - 1) return renderGridSize();
-  gridPush();
-  for (const [ax, n] of [['h', nr], ['v', nc]]) {
-    const L = g[ax];
-    if (L.length - 1 === n) continue;
-    const a = L[0], b = L[L.length - 1];
-    g[ax] = Array.from({ length: n + 1 }, (_, i) => (i === n ? b.slice() : a.slice()));
-    spreadEven(g, ax, 0, n);
+  const want = { h: val('#g-rows'), v: val('#g-cols') };
+  if (want.h === g.h.length - 1 && want.v === g.v.length - 1) return renderGridSize();
+  const all = BX.gridFresh || BX.sizeEven || $('#g-moveall').checked, m = S.model, sync = {}, held = {}, sizeEven = BX.sizeEven;
+  if (!BX.gridFresh && !gridSizeDiffers()) for (const ax of ['h', 'v']) {
+    const d = want[ax] - (g[ax].length - 1);
+    if (d > 0) sync[ax] = true;
+    else if (d < 0) { held[ax] = edgeTextCells(ax, gridSide(ax), -d).length > 0; sync[ax] = !held[ax]; }
   }
+  const anySync = !!(sync.h || sync.v);
+  gridPush();  // one step: the lines, the table and the boxes
+  BX.sizeEven = sizeEven; BX.gSel = null;
+  const said = [], sel0 = { ...S.sel }, selMap = {};
+  for (const ax of ['h', 'v']) {
+    const n0 = g[ax].length - 1, n = want[ax], row = ax === 'h', start = gridSide(ax), side = sideName(ax, start);
+    if (n0 === n) continue;
+    const what = (k) => plural(k, row ? 'row' : 'column');
+    if (all) {
+      const a = g[ax][0], b = g[ax][n0];
+      g[ax] = Array.from({ length: n + 1 }, (_, i) => (i === n ? b.slice() : a.slice()));
+      spreadEven(g, ax, 0, n);
+    } else if (n > n0) {
+      let split = 0;
+      for (let k = n0; k < n; k++) if (!gridAddAtSide(g, ax, start)) split++;
+      said.push(`${what(n - n0)} added at the ${side}` + (split ? ` (no room on the image there: the ${start ? 'first' : 'last'} ${row ? 'row' : 'column'} was split)` : ''));
+    } else {
+      for (let k = n0; k > n; k--) g[ax].splice(start ? 0 : g[ax].length - 1, 1);
+      said.push(`${what(n0 - n)} removed at the ${side}`);
+    }
+    if (sync[ax]) {
+      const kind = row ? 'row' : 'col', N = () => m[row ? 'nRows' : 'nCols'], key = (n > n0 ? 'insert_' : 'delete_') + kind;
+      if (n > n0) { for (let k = n0; k < n; k++) insertLine(kind, start ? 0 : N()); if (start) selMap[kind] = i => i + n - n0; }
+      else { const d = n0 - n; deleteLines(kind, start ? 0 : N() - d, start ? d - 1 : N() - 1); selMap[kind] = start ? (i => Math.max(0, i - d)) : (i => Math.min(i, N() - 1)); }
+      S.meta.edit_counts[key] = (S.meta.edit_counts[key] || 0) + 1;
+      said.push(n > n0 ? `the table got ${n - n0 > 1 ? (n - n0) + ' empty ' + (row ? 'rows' : 'columns') : 'an empty ' + (row ? 'row' : 'column')} at the ${side} too`
+        : `the table lost its empty ${row ? 'row' : 'column'}${n0 - n > 1 ? 's' : ''} at the ${side} too`);
+    } else if (held[ax]) said.push(`the table keeps its ${row ? 'rows' : 'columns'} at the ${side} (they have text)`);
+  }
+  if (anySync) { S.sel = keepSel(sel0, selMap); refreshSlots(); renderGrid(); }
   drawGrid(); renderBoxbar();
-  toast(gridSizeDiffers() ? `Grid of ${nr} rows × ${nc} columns, spread evenly. Move the lines, then Make boxes: the table becomes ${nr} × ${nc}.`
-    : `Grid of ${nr} × ${nc}, the size of the table.`, 5000);
+  const how = all ? 'All the lines are spread evenly' : 'Your other lines stay where they are';
+  const text = (said.length ? said.join('; ').replace(/^./, ch => ch.toUpperCase()) + '. ' : '') + how + '. Ctrl+Z undoes it.';
+  const df = gridDiff(), ask = df.fewer.filter(ax => !(BX.partial && BX.partial[ax])), fw = ask.map(ax => (ax === 'h' ? 'rows' : 'columns')).join(' and ');
+  if (ask.length) BX.askedFewer = true;
+  toast(!gridSizeDiffers() ? `Grid of ${want.h} × ${want.v}, the size of the table. ${text}`
+    : `Grid of ${want.h} rows × ${want.v} columns. ${text} The table is ${S.model.nRows} × ${S.model.nCols}: `
+      + (ask.length ? `choose in the grid bar: keep the table (boxes for the ${fw} the grid has), or make the table match (you pick the ${fw} to delete or merge).`
+        : df.more.length ? `the boxes follow the lines when the sizes match (Close grid adds the ${df.more.map(ax => (ax === 'h' ? 'rows' : 'columns')).join(' and ')}).`
+          : `the boxes follow the lines for the ${df.fewer.map(ax => gridFitText(ax).have).join(' and ')}.`), 8000);
+  gridLive();
+  if (anySync && gridSizeDiffers()) changed();  // the table changed, but the boxes wait for the other size
 }
+/* A new outer line at one side, as far from the line there as the row (column) at that side is wide. When the image
+   has no room for half of it, the row at that side is split in two instead (false). */
+function gridAddAtSide(g, ax, start) {
+  const L = g[ax], n = L.length - 1, edge = start ? L[0] : L[n], inner = start ? L[1] : L[n - 1], span = gSpan(ax);
+  const out = [0, 1].map(k => clamp(edge[k] + (edge[k] - inner[k]), 0, span));
+  const room = Math.min(...[0, 1].map(k => Math.abs(out[k] - edge[k]) / Math.max(1, Math.abs(edge[k] - inner[k]))));
+  if (room >= 0.5) { if (start) L.unshift(out); else L.push(out); return true; }
+  L.splice(start ? 1 : n, 0, [0, 1].map(k => (edge[k] + inner[k]) / 2));
+  return false;
+}
+/* Right-click inside the grid: add a row or column line there (the other lines stay), or remove the line. When
+   the grid has the size of the table, the table gets the new row or column too (empty), so the boxes follow. */
+function gridLineMenu(x, y, p) {
+  BX.gridMenuPt = p;
+  const same = !gridSizeDiffers(), h = gridHit(p), items = [
+    ['gline:add:h', same ? 'Add a row line here (and an empty row in the table)' : 'Add a row line here', ''],
+    ['gline:add:v', same ? 'Add a column line here (and an empty column in the table)' : 'Add a column line here', ''],
+  ];
+  if (h) {
+    const last = BX.grid[h.ax].length - 1, row = h.ax === 'h';
+    const what = h.i === 0 ? `the ${row ? 'top' : 'left'} border` : h.i === last ? `the ${row ? 'bottom' : 'right'} border` : `this ${row ? 'row' : 'column'} line`;
+    if (last > 1) items.push(null, [`gline:del:${h.ax}:${h.i}`, `Remove ${what}${gridDelWhat(h.ax, h.i)}`, '']);
+  }
+  const cells = gridCellItems(p, h);
+  if (cells.length) items.push(null, ...cells);
+  showMenuItems(x, y, items);
+}
+function gridLineOp(op) {
+  if (!BX.grid || BX.gridFresh) return;
+  const [, what, ax, i] = op.split(':');
+  if (what === 'del') return gridLineDel(ax, +i);
+  if (what === 'add' && BX.gridMenuPt) return gridLineAdd(ax, BX.gridMenuPt);
+}
+function gridLineAdd(ax, p) {
+  const g = BX.grid, L = g[ax], a = gAlong(ax, p), pos = gPos(ax, p);
+  let k = -1;
+  for (let i = 0; i < L.length - 1; i++) if (gAt(ax, L[i], a) < pos && pos < gAt(ax, L[i + 1], a)) { k = i; break; }
+  const first = gAt(ax, L[0], a), lastP = gAt(ax, L[L.length - 1], a), out = k < 0 ? (pos <= first ? 'start' : pos >= lastP ? 'end' : 'on') : null;
+  if (pos < 0 || pos > gSpan(ax)) return toast('Right-click on the image, where the line goes.');
+  if (out === 'on') return toast('There is a line there already.');
+  if (out && Math.abs(pos - (out === 'start' ? first : lastP)) * IV.scale < 4) return toast('Too close to the border: right-click a little further from it.');
+  if (!out && (Math.min(pos - gAt(ax, L[k], a), gAt(ax, L[k + 1], a) - pos)) * IV.scale < 4) return toast('Too close to a line: right-click a little further from it.');
+  const sync = !gridSizeDiffers(), row = ax === 'h';
+  BX.gSel = null;
+  gridPush();  // one step: the line, the table and the boxes
+  if (out) {  // outside the grid: a new border, parallel to the one it replaces
+    const B = out === 'start' ? L[0] : L[L.length - 1], d = pos - (out === 'start' ? first : lastP), nl = [B[0] + d, B[1] + d];
+    if (out === 'start') { L.unshift(nl); k = -1; } else { L.push(nl); k = L.length - 3; }
+  } else {
+    const p0 = gAt(ax, L[k], a), p1 = gAt(ax, L[k + 1], a), t = (pos - p0) / (p1 - p0);
+    L.splice(k + 1, 0, [0, 1].map(j => L[k][j] + (L[k + 1][j] - L[k][j]) * t));  // tilted like the lines around it
+  }
+  if (sync) {
+    const sel0 = { ...S.sel };
+    insertLine(row ? 'row' : 'col', k + 1);
+    S.sel = keepSel(sel0, { [row ? 'row' : 'col']: i => (i > k ? i + 1 : i) });
+    S.meta.edit_counts['insert_' + (row ? 'row' : 'col')] = (S.meta.edit_counts['insert_' + (row ? 'row' : 'col')] || 0) + 1;
+    refreshSlots(); renderGrid();
+  }
+  drawGrid(); renderBoxbar(); gridLive();
+  const name = row ? `row ${k + 2}` : `column ${colName(k + 1)}`;
+  toast(sync ? `Line added, and ${name} is a new empty ${row ? 'row' : 'column'} in the table; the other lines stay. Ctrl+Z undoes it.`
+    : `${row ? 'Row' : 'Column'} line added; the other lines stay. Ctrl+Z undoes it.`, 5000);
+}
+/* Remove line i of axis ax; the other lines stay where they are. A border: the next line becomes the border (the
+   row or column at that edge leaves the grid). When the grid had the size of the table, the row (column) of the
+   table that the grid lost goes too if it is empty; with text, the table keeps it and the boxes wait. */
+function gridLineDel(ax, i) {
+  const g = BX.grid, L = g[ax], last = L.length - 1, row = ax === 'h', kind = row ? 'row' : 'col';
+  if (!(i >= 0 && i <= last)) return;
+  if (last < 2) return toast(`The grid needs at least one ${row ? 'row' : 'column'}.`);
+  const sync = !gridSizeDiffers();
+  const cands = i === 0 ? [0] : i === last ? [last - 1] : [i, i - 1];  // the table rows the grid merges or loses
+  const gone = sync ? cands.find(r => lineEmpty(kind, r)) : undefined;
+  const lname = gridLineName(ax, i).replace(/^[A-Z]/, ch => ch.toLowerCase());
+  gridPush(); BX.gSel = null; BX.gridHotKey = null;  // one step: the line, the table and the boxes
+  L.splice(i, 1);
+  if (gone !== undefined) {
+    const sel0 = { ...S.sel };
+    deleteLines(kind, gone, gone);
+    S.sel = keepSel(sel0, { [kind]: j => (j > gone ? j - 1 : Math.min(j, (row ? S.model.nRows : S.model.nCols) - 1)) });
+    S.meta.edit_counts['delete_' + kind] = (S.meta.edit_counts['delete_' + kind] || 0) + 1;
+    refreshSlots(); renderGrid();
+  }
+  drawGrid(); renderBoxbar(); gridLive();
+  const name = r => (row ? `row ${r + 1}` : `column ${colName(r)}`);
+  toast(gone !== undefined ? `Removed the ${lname}, and the empty ${name(gone)} of the table with it; the other lines stay. Ctrl+Z undoes it.`
+    : sync ? `Removed the ${lname}; the other lines stay. The table keeps its ${cands.map(name).join(' and ')} (text in ${cands.length > 1 ? 'both' : 'it'}): the boxes follow again when the sizes match (merge or delete a ${row ? 'row' : 'column'} in the table, or add a line). Ctrl+Z undoes it.`
+    : gridSizeDiffers() ? `Removed the ${lname}; the other lines stay. The grid has ${plural(L.length - 1, row ? 'row' : 'column')}, the table ${row ? S.model.nRows : S.model.nCols}: the boxes follow when the sizes match. Ctrl+Z undoes it.`
+    : `Removed the ${lname}; the other lines stay. The grid has the size of the table now: the boxes follow the lines. Ctrl+Z undoes it.`, 7000);
+}
+/* A row (column) of the table with no text and no merged cell across it: removing it loses nothing. */
+function lineEmpty(kind, k) {
+  const a = AX[kind];
+  return S.model.cells.every(c => c[a.p] > k || c[a.p] + c[a.s] - 1 < k || (c[a.s] === 1 && !c.text));
+}
+/* What removing line i does to the rows or columns, said after its name. */
+function gridDelWhat(ax, i) {
+  const last = BX.grid[ax].length - 1, row = ax === 'h';
+  if (i === 0) return row ? ' (row 1 leaves the grid)' : ' (column A leaves the grid)';
+  if (i === last) return row ? ` (row ${last} leaves the grid)` : ` (column ${colName(last - 1)} leaves the grid)`;
+  return row ? ` (rows ${i} and ${i + 1} become one)` : ` (columns ${colName(i - 1)} and ${colName(i)} become one)`;
+}
+/* The line a click removes with the remove tool: the nearest one within 14 px on screen. */
+function gridDelTarget(p) {
+  const g = BX.grid, tol = 14 / IV.scale;
+  let best = null;
+  for (const ax of ['h', 'v']) g[ax].forEach((_, i) => {
+    const [A, B] = visEnds(g, ax, i), d = segDist(p, A, B);
+    if (d <= tol && (!best || d < best.d)) best = { ax, i, d };
+  });
+  return best;
+}
+/* The click tool of the grid: null (move the lines) or 'del' (a click removes a line). */
+function gridTool(t) {
+  BX.gTool = t; BX.gridHotKey = null; BX.gridHint = null;
+  if (t) BX.gSel = null;
+  gridToolUI(); drawGrid(); renderBoxbar();
+  if (t === 'del') toast('Click the lines to remove; the other lines stay where they are. Esc: done.', 3500);
+}
+function gridToolUI() { const b = $('#g-deltool'); if (b) b.classList.toggle('on', BX.gTool === 'del'); }
 function gridResizeDialog() {
   const g = BX.grid, m = S.model, nr = g.h.length - 1, nc = g.v.length - 1;
-  const parts = [];
-  if (nr > m.nRows) parts.push(`adds ${plural(nr - m.nRows, 'empty row')} at the bottom`);
-  if (nr < m.nRows) parts.push(`removes the last ${plural(m.nRows - nr, 'row')} (${nr + 1}${m.nRows - nr > 1 ? '–' + m.nRows : ''})`);
-  if (nc > m.nCols) parts.push(`adds ${plural(nc - m.nCols, 'empty column')} at the right`);
-  if (nc < m.nCols) parts.push(`removes the last ${plural(m.nCols - nc, 'column')} (${colName(nc)}${m.nCols - nc > 1 ? '–' + colName(m.nCols - 1) : ''})`);
-  const lost = m.cells.filter(c => (c.r >= nr || c.c >= nc) && c.text).length;
+  const sh = gridSide('h'), sv = gridSide('v'), parts = [], dr = m.nRows - nr, dc = m.nCols - nc;
+  const span = (a, b, name) => name(a) + (b > a ? '–' + name(b) : '');
+  if (dr < 0) parts.push(`adds ${plural(-dr, 'empty row')} at the ${sideName('h', sh)}`);
+  const some = (d, w) => (d > 1 ? `${d} ${w}s` : w);
+  if (dr > 0) parts.push(`removes the ${sh ? 'first' : 'last'} ${some(dr, 'row')} (${sh ? span(0, dr - 1, i => i + 1) : span(nr, m.nRows - 1, i => i + 1)})`);
+  if (dc < 0) parts.push(`adds ${plural(-dc, 'empty column')} at the ${sideName('v', sv)}`);
+  if (dc > 0) parts.push(`removes the ${sv ? 'first' : 'last'} ${some(dc, 'column')} (${sv ? span(0, dc - 1, colName) : span(nc, m.nCols - 1, colName)})`);
+  const lost = new Set([...(dr > 0 ? edgeTextCells('h', sh, dr) : []), ...(dc > 0 ? edgeTextCells('v', sv, dc) : [])]).size;
   openModal(`<h2>Make the table ${nr} × ${nc}?</h2>
-    <p>The grid has ${plural(nr, 'row')} and ${plural(nc, 'column')}, the table ${m.nRows} × ${m.nCols}. Make boxes ${parts.join(' and ')}, then gives every cell the box between its lines.${lost ? ` <b>${plural(lost, 'cell')} with text ${lost === 1 ? 'is' : 'are'} deleted.</b>` : ''} Ctrl+Z undoes it.</p>
-    <p class="muted">Rows or columns missing in the middle of the table? Cancel, insert them in the table (Row +↑, Col +←), then open the grid again.</p>
-    <div class="actions"><button data-close>Cancel</button><button class="primary" id="gr-ok">Resize the table and make boxes</button></div>`);
-  $('#gr-ok').onclick = () => { closeModal(); gridApply(); closeGrid(false); };
+    <p>The grid has ${plural(nr, 'row')} and ${plural(nc, 'column')}, the table ${m.nRows} × ${m.nCols}. This ${parts.join(' and ')}, then gives every cell the box between its lines.${lost ? ` <b>${plural(lost, 'cell')} with text ${lost === 1 ? 'is' : 'are'} deleted.</b>` : ''} Ctrl+Z undoes it.</p>
+    <p class="muted">Not at the right side? Cancel and change where rows and columns are added or removed, in Options ▾ of the grid bar. Rows or columns missing in the middle of the table? Cancel, then right-click on the image where the line is missing: "Add a row line here" adds it to the table too, once the sizes match (or insert them in the table: Row +↑, Col +←).</p>
+    <div class="actions"><button data-close>Cancel</button><button class="primary" id="gr-ok">Resize the table and make the boxes</button></div>`);
+  $('#gr-ok').onclick = () => { closeModal(); gridApply(); closeGrid('drop'); };
 }
-/* Rows and columns added at the bottom / right, or removed from there. */
-function resizeTable(nr, nc) {
+/* Close grid with fewer rows or columns than the table, before the choice: keep the table, or make it match. */
+function gridFewerDialog() {
+  const { fewer, more } = gridDiff(), m = S.model, what = fewer.map(ax => (ax === 'h' ? 'rows' : 'columns')).join(' and ');
+  const t = fewer.map(gridFitText);
+  const extra = more.length ? ` The grid has more ${more.map(ax => (ax === 'h' ? 'rows' : 'columns')).join(' and ')}: the table gets them (empty) at the side chosen in the grid bar.` : '';
+  openModal(`<h2>The grid has fewer ${what} than the table</h2>
+    <p>Grid ${BX.grid.h.length - 1} × ${BX.grid.v.length - 1}, table ${m.nRows} × ${m.nCols}.${extra}</p>
+    <div class="gf-opts">
+      <button id="gf-keep"><b>Keep the table as it is</b><span>Boxes from the lines for ${t.map(x => x.have).join(' and ')}. ${t.map(x => x.none[0].toUpperCase() + x.none.slice(1)).join(' and ')}: no box for now; draw ${t.length > 1 || /s /.test(t[0].none) ? 'them' : 'it'} later (Done lists the cells without a box).</span></button>
+      <button id="gf-match"><b>Make the table match the grid…</b><span>Choose which ${what} of the table to delete, or to merge into the one before (their text joins it).</span></button>
+    </div>
+    <div class="actions"><button data-close>Back to the grid</button></div>`, { wide: false });
+  $('#gf-keep').onclick = () => {
+    closeModal();
+    gridKeepTable();
+    if (more.length) {  // the rows (columns) the grid has more of: added to the table, empty, at the side chosen
+      const g = BX.grid, mm = S.model;
+      apply('grid_resize', () => {
+        for (const ax of more) {
+          const kind = ax === 'h' ? 'row' : 'col', n = g[ax].length - 1, cnt = () => (ax === 'h' ? mm.nRows : mm.nCols);
+          while (cnt() < n) insertLine(kind, gridSide(ax) ? 0 : cnt());
+        }
+        return 'grid_resize';
+      });
+      refreshSlots(); renderGrid(); gridLive();
+    }
+    closeGrid('done');
+  };
+  $('#gf-match').onclick = () => { closeModal(); gridMatchDialog(fewer, () => { if (!gridSizeDiffers()) closeGrid('done'); }); };
+}
+/* "Make the table match": for each axis in axes (h: rows, v: columns), pick the lines of the table to delete or to
+   merge into the line before, as many as the grid has fewer. One step of the history. */
+function gridMatchDialog(axes, then) {
+  const ax = axes[0], row = ax === 'h', kind = row ? 'row' : 'col', m = S.model;
+  const nt = row ? m.nRows : m.nCols, ng = BX.grid[ax].length - 1, d = nt - ng;
+  if (d <= 0) return axes.length > 1 ? gridMatchDialog(axes.slice(1), then) : then && then();
+  const name = k => (row ? `Row ${k + 1}` : `Column ${colName(k)}`);
+  const preview = k => {
+    const t = m.cells.filter(c => (row ? c.r : c.c) === k && c.text).sort((a, b) => (row ? a.c - b.c : a.r - b.r)).map(c => c.text.replace(/<[^>]+>/g, ''));
+    return t.length ? t.join(' · ') : '';
+  };
+  const pick = new Map();
+  const order = [...Array(nt).keys()];
+  if (!gridSide(ax)) order.reverse();  // empty lines at the side chosen in the grid bar are suggested first
+  for (const k of order) { if (pick.size >= d) break; if (lineEmpty(kind, k)) pick.set(k, 'del'); }
+  const before = row ? 'the row above' : 'the column to the left';
+  const problem = () => {
+    if (pick.size !== d) return `Choose ${d} (${pick.size} chosen).`;
+    for (const [k, how] of pick) if (how === 'merge' && ![...Array(k).keys()].some(j => pick.get(j) !== 'del')) return `${name(k)} cannot merge: no ${row ? 'row' : 'column'} before it stays.`;
+    return '';
+  };
+  const render = () => {
+    $('#gm-body').innerHTML = [...Array(nt).keys()].map(k => {
+      const v = pick.get(k) || '', pv = preview(k);
+      return `<tr class="${v ? 'gm-' + v : ''}"><td class="gm-n">${esc(name(k))}</td><td class="gm-t">${pv ? esc(pv.length > 110 ? pv.slice(0, 110) + '…' : pv) : '<span class="muted">empty</span>'}</td>
+        <td class="gm-c"><label><input type="radio" name="gm${k}" data-k="${k}" value=""${v === '' ? ' checked' : ''}> keep</label><label><input type="radio" name="gm${k}" data-k="${k}" value="del"${v === 'del' ? ' checked' : ''}> delete</label><label title="Its text joins ${before}, cell by cell"${k === 0 ? ' class="muted"' : ''}><input type="radio" name="gm${k}" data-k="${k}" value="merge"${v === 'merge' ? ' checked' : ''}${k === 0 ? ' disabled' : ''}> merge into ${before}</label></td></tr>`;
+    }).join('');
+    const bad = problem();
+    $('#gm-msg').textContent = bad || `${d} chosen: the table will have ${ng} ${row ? 'rows' : 'columns'}, like the grid.`;
+    $('#gm-msg').className = bad ? 'bad' : 'muted';
+    $('#gm-ok').disabled = !!bad;
+  };
+  openModal(`<h2>Make the table ${ng} ${row ? 'rows' : 'columns'}: choose ${d} to delete or merge</h2>
+    <p class="muted">The grid has ${ng} ${row ? 'rows' : 'columns'}, the table ${nt}. Delete: the ${row ? 'row' : 'column'} and its text go. Merge: its text joins ${before}, cell by cell. Ctrl+Z undoes it.</p>
+    <div class="gm-wrap"><table class="gm"><tbody id="gm-body"></tbody></table></div>
+    <div id="gm-msg"></div>
+    <div class="actions"><button data-close>Cancel</button><button class="primary" id="gm-ok">${row ? 'Delete / merge these rows' : 'Delete / merge these columns'}</button></div>`, { wide: true });
+  $('#gm-body').addEventListener('change', e => {
+    const t = e.target.closest('input[data-k]'); if (!t) return;
+    const k = +t.dataset.k;
+    if (t.value) pick.set(k, t.value); else pick.delete(k);
+    render();
+  });
+  $('#gm-ok').onclick = () => {
+    if (problem()) return;
+    closeModal();
+    const dels = [...pick].filter(([, h]) => h === 'del').map(([k]) => k).sort((a, b) => b - a);
+    const merges = [...pick].filter(([, h]) => h === 'merge').map(([k]) => k);
+    const ok = apply('grid_match', () => {
+      for (const k of dels) deleteLines(kind, k, k);
+      const shifted = merges.map(k => k - dels.filter(x => x < k).length).sort((a, b) => b - a);
+      for (const k of shifted) mergeLineInto(kind, k);
+      return 'grid_match';
+    });
+    if (!ok) return;
+    refreshSlots(); renderGrid();
+    toast(`${row ? 'Rows' : 'Columns'}: ${dels.length ? dels.length + ' deleted' : ''}${dels.length && merges.length ? ', ' : ''}${merges.length ? merges.length + ' merged' : ''}. The table has the ${row ? 'rows' : 'columns'} of the grid. Ctrl+Z undoes it.`, 5000);
+    if (axes.length > 1) return gridMatchDialog(axes.slice(1), then);
+    gridLive();
+    if (then) then();
+  };
+  render();
+}
+/* Line k of the table (a row or a column) joins line k - 1: the text of each of its cells goes to the cell before it
+   (a space between); a cell across more lines keeps its text. Then line k is deleted. */
+function mergeLineInto(kind, k) {
+  const m = S.model, a = AX[kind], o = kind === 'row' ? AX.col : AX.row, sl = slotsOf(m);
+  const at = (i, j) => (kind === 'row' ? sl[i][j] : sl[j][i]);
+  for (let j = 0; j < m[o.n]; j++) {
+    const ci = at(k, j), pi = at(k - 1, j);
+    if (ci < 0 || pi < 0 || ci === pi) continue;
+    const c = m.cells[ci], p = m.cells[pi];
+    if (c[a.p] !== k || c[a.s] !== 1 || c[o.p] !== j || !c.text) continue;
+    p.text = p.text ? p.text + ' ' + c.text : c.text; p.edited = true;
+  }
+  return deleteLines(kind, k, k);
+}
+/* Rows and columns added at the bottom / right (top / left when sh / sv), or removed from there. */
+function resizeTable(nr, nc, sh = false, sv = false) {
   const m = S.model;
-  while (m.nRows < nr) insertLine('row', m.nRows);
-  if (m.nRows > nr) deleteLines('row', nr, m.nRows - 1);
-  while (m.nCols < nc) insertLine('col', m.nCols);
-  if (m.nCols > nc) deleteLines('col', nc, m.nCols - 1);
+  while (m.nRows < nr) insertLine('row', sh ? 0 : m.nRows);
+  if (m.nRows > nr) { const d = m.nRows - nr; deleteLines('row', sh ? 0 : nr, sh ? d - 1 : m.nRows - 1); }
+  while (m.nCols < nc) insertLine('col', sv ? 0 : m.nCols);
+  if (m.nCols > nc) { const d = m.nCols - nc; deleteLines('col', sv ? 0 : nc, sv ? d - 1 : m.nCols - 1); }
 }
 function spreadEven(g, ax, from, to) {  // inner lines between line `from` and line `to`, evenly
   const L = g[ax];
@@ -2702,12 +3534,14 @@ for (const id of ['#g-rows', '#g-cols']) {
 $('#bx-gridbar').addEventListener('click', e => {
   const b = e.target.closest('button[data-g]'); if (!b) return;
   const a = b.dataset.g;
-  if (a === 'cancel') closeGrid(false);
-  else if (a === 'apply') closeGrid(true);
-  else if (a === 'even') { gridPush(); const g = BX.grid; spreadEven(g, 'h', 0, g.h.length - 1); spreadEven(g, 'v', 0, g.v.length - 1); drawGrid(); }
-  else if (a === 'snap') { gridPush(); gridSnap(); }
-  else if (a === 'undo') gridUndo(false);
-  else if (a === 'redo') gridUndo(true);
+  if (a === 'cancel') closeGrid('cancel');
+  else if (a === 'apply') closeGrid('done');
+  else if (a === 'deltool') gridTool(BX.gTool === 'del' ? null : 'del');
+  else if (a === 'gkeep') gridKeepTable();
+  else if (a === 'gmatch') { const f = gridDiff().fewer; if (f.length) gridMatchDialog(f); }
+  else if (a === 'even') { gridPush(); const g = BX.grid; spreadEven(g, 'h', 0, g.h.length - 1); spreadEven(g, 'v', 0, g.v.length - 1); drawGrid(); gridLive(); }
+  else if (a === 'snap') { gridPush(); gridSnap(); gridLive(); }
+  else if (a === 'opts') gridOpts($('#g-opts').hidden);
   else if (a === 'start') { const r = b.getBoundingClientRect(); gridMenu(r.left, r.bottom + 4); }
 });
 /* Drag on the image (not on a line) with the grid open: the outline of the table; the lines are spread inside it. */
@@ -2717,20 +3551,62 @@ function gridFrameDrag(d, p) {
   d.rect = [Math.min(s[0], q[0]), Math.min(s[1], q[1]), Math.max(s[0], q[0]), Math.max(s[1], q[1])];
   drawDraft({ bbox: d.rect, polygon: null });
 }
-/* Undo for the lines while the grid is open (Snap, Even, outline, moved or tilted lines). */
+/* A change of the lines (Snap, Even, outline, moved, added or removed lines) is a step of the history, made before
+   the change: the table as it is (with its boxes) and the lines before (before, or the lines now). */
 function gridPush(before) {
-  BX.gUndo.push({ g: cloneGrid(before || BX.grid), fresh: !!BX.gridFresh });
-  if (BX.gUndo.length > 100) BX.gUndo.shift();
-  BX.gRedo = [];
+  const e = snapshot();
+  Object.assign(e, { grid: cloneGrid(before || BX.grid), fresh: !!BX.gridFresh, partial: Object.assign({}, BX.partial), gs: BX.gs, gtag: true });
+  S.undo.push(e); if (S.undo.length > 300) S.undo.shift();
+  S.redo = [];
+  BX.sizeEven = false; BX.nudged = null;
 }
-function gridUndo(isRedo) {
-  if (BX.drag) return;
-  const from = isRedo ? BX.gRedo : BX.gUndo, to = isRedo ? BX.gUndo : BX.gRedo;
-  if (!from.length) return toast(isRedo ? 'Nothing to redo in the grid.' : 'Nothing to undo in the grid. (Cancel closes it without changing the boxes.)');
-  to.push({ g: cloneGrid(BX.grid), fresh: !!BX.gridFresh });
-  const st = from.pop();
-  BX.grid = st.g; BX.gridFresh = st.fresh;
-  drawGrid(); renderBoxbar();
+const gridSteps = () => (BX.grid ? S.undo.filter(e => e.gs === BX.gs && e.gtag).length : 0);
+const gridTopIsStep = () => { const t = S.undo[S.undo.length - 1]; return !!(t && histLines(t)); };
+function gridUndo(isRedo) { return isRedo ? redo() : undo(); }
+/* Closing the grid: each run of changes of the lines, one after the other, becomes one step. */
+function gridCollapse() {
+  const gs = BX.gs, out = [];
+  for (const e of S.undo) {
+    const p = out[out.length - 1];
+    if (e.gs === gs && e.gtag && p && p.gs === gs && p.gtag) continue;
+    out.push(e);
+  }
+  S.undo = out;
+  S.redo = S.redo.filter(e => e.gs !== gs);
+}
+/* Cancel: the boxes as they were before the first change of the lines. Text typed meanwhile stays. */
+function gridCancel() {
+  const gs = BX.gs, i0 = S.undo.findIndex(e => e.gs === gs && e.gtag), first = S.undo[i0];
+  if (!first) return;
+  const typed = S.undo.slice(i0).some(e => e.gs === gs && !e.gtag), after = snapshot();
+  if (!typed) {
+    S.undo.splice(i0);
+    S.redo = S.redo.filter(e => e.gs !== gs); S.redo.push(after);
+    restore({ model: cloneModel(first.model), sel: Object.assign({}, first.sel), from: first.from });
+    toast('Grid closed: the boxes are back as they were. Ctrl+Y brings back the boxes of the lines.', 5000);
+  } else {  // only the boxes go back (the cells at the same place), the text stays
+    gridCollapse();
+    S.undo.push(after); S.redo = [];
+    const key = c => `${c.r},${c.c},${c.rs},${c.cs}`, old = new Map(first.model.cells.map(c => [key(c), c]));
+    for (const c of S.model.cells) {
+      const o = old.get(key(c));
+      if (o) { c.bbox = o.bbox ? o.bbox.slice() : null; c.polygon = o.polygon ? o.polygon.map(q => q.slice()) : null; c.box_by = o.box_by || null; }
+    }
+    toast('Grid closed: the boxes are back as they were; what you typed meanwhile stays. Ctrl+Z brings back the boxes of the lines.', 6000);
+  }
+  S.meta.grid_lines = BX.gridStartLines;
+  changed(); drawBoxes(); drawOverlay();
+}
+/* The boxes follow the lines: each change of the lines gives the cells their box at once, and it is saved. Nothing
+   happens while the grid and the table differ in size, or before the outline is drawn. */
+function gridLive() {
+  const fit = gridFit();
+  if (!fit) { renderGridSize(); return 0; }
+  if (!BX.gCounted) { S.meta.edit_counts.box_grid = (S.meta.edit_counts.box_grid || 0) + 1; BX.gCounted = true; }
+  const n = setGridBoxes(BX.grid, $('#g-keep').checked, fit);
+  S.meta.grid_lines = { h: BX.grid.h.map(l => l.map(round1)), v: BX.grid.v.map(l => l.map(round1)) };
+  changed(); drawBoxes(); drawOverlay(); drawGrid(); renderBoxbar();
+  return n;
 }
 function gridFrameUp(d) {
   BX.drag = null;
@@ -2746,42 +3622,143 @@ function gridFrameUp(d) {
   drawGrid(); renderBoxbar();
   toast(fresh ? 'Lines spread inside the outline. Now "Snap" puts them on the lines of the page.'
     : 'Lines fitted inside the new outline, with the same spacing. "Snap" puts them on the lines of the page.', 3500);
+  gridLive();
 }
+/* Every cell gets the box between its lines (but the boxes made by hand with "Keep the boxes I drew or fixed by hand"). */
+function setGridBoxes(g, keep, fit) {
+  const tilted = ['h', 'v'].some(ax => g[ax].some(l => Math.abs(l[1] - l[0]) > 0.5));
+  const oh = fit ? fit.h : 0, ov = fit ? fit.v : 0;
+  let n = 0;
+  for (const c of S.model.cells) {
+    if (keep && c.bbox && c.box_by === 'hand') continue;
+    const r = c.r - oh, k = c.c - ov;
+    if (r < 0 || k < 0 || r + c.rs > g.h.length - 1 || k + c.cs > g.v.length - 1) { setBox(c, null); continue; }  // outside the grid: no box
+    const T = g.h[r], B = g.h[r + c.rs], L = g.v[k], R = g.v[k + c.cs];
+    const P = [crossPt(T, L), crossPt(T, R), crossPt(B, R), crossPt(B, L)];
+    setBox(c, bboxOf(P), tilted ? P : null, 'grid');
+    n++;
+  }
+  return n;
+}
+/* The grid of another size than the table: the table is resized, then the boxes (one undo step). */
 function gridApply() {
   const g = BX.grid, keep = $('#g-keep') && $('#g-keep').checked;
-  const tilted = ['h', 'v'].some(ax => g[ax].some(l => Math.abs(l[1] - l[0]) > 0.5));
   let n = 0, resized = false;
   const made = apply('box', () => {
-    if (gridSizeDiffers()) { resizeTable(g.h.length - 1, g.v.length - 1); resized = true; }
-    for (const c of S.model.cells) {
-      if (keep && c.bbox && c.box_by === 'hand') continue;
-      const T = g.h[c.r], B = g.h[c.r + c.rs], L = g.v[c.c], R = g.v[c.c + c.cs];
-      const P = [crossPt(T, L), crossPt(T, R), crossPt(B, R), crossPt(B, L)];
-      setBox(c, bboxOf(P), tilted ? P : null, 'grid');
-      n++;
-    }
+    if (gridSizeDiffers()) { resizeTable(g.h.length - 1, g.v.length - 1, gridSide('h'), gridSide('v')); resized = true; }
+    n = setGridBoxes(g, keep);
     return n ? (resized ? 'grid_resize' : 'box_grid') : false;
   });
   S.meta.grid_lines = { h: g.h.map(l => l.map(round1)), v: g.v.map(l => l.map(round1)) };
   if (made) BX.lastGrid = { snap: S.undo[S.undo.length - 1], g: cloneGrid(g) };
   S.dirty = true; scheduleSave();
-  toast(n ? `${n} box${n > 1 ? 'es' : ''} made from the lines. Drag the edges of a box to adjust it. ▦ Back to grid (or Ctrl+Z) opens the lines again.` : 'Every cell has a box made by hand (uncheck "keep my boxes").', 5000);
+  toast(n ? `${n} box${n > 1 ? 'es' : ''} made from the lines. Drag the edges of a box to adjust it. ▦ Back to grid (or Ctrl+Z) opens the lines again.` : 'Every cell has a box made by hand, so the lines changed none (Options ▾ of the grid bar: untick "Keep the boxes I drew or fixed by hand").', 5000);
+}
+/* The merged cells of the table, seen on the grid (only when the grid gives the boxes, so its rows and columns are
+   those of the table): h[i][j] is true when row line i, in column j of the grid, lies inside a merged cell (v[j][i]
+   likewise for column line j in row i), and cells holds the 4 lines around each merged cell. */
+function gridMerges(g) {
+  const fit = gridFit();
+  if (!fit) return null;
+  const sl = S.slots, nr = g.h.length - 1, nc = g.v.length - 1, same = (a, b) => a >= 0 && a === b;
+  const out = { h: [], v: [], cells: [] };
+  for (let i = 1; i < nr; i++) out.h[i] = Array.from({ length: nc }, (_, j) => same(sl[i + fit.h - 1][j + fit.v], sl[i + fit.h][j + fit.v]));
+  for (let j = 1; j < nc; j++) out.v[j] = Array.from({ length: nr }, (_, i) => same(sl[i + fit.h][j + fit.v - 1], sl[i + fit.h][j + fit.v]));
+  for (const c of S.model.cells) {
+    if (c.rs === 1 && c.cs === 1) continue;
+    const r = c.r - fit.h, k = c.c - fit.v;
+    if (r < 0 || k < 0 || r + c.rs > nr || k + c.cs > nc) continue;
+    out.cells.push([g.h[r], g.h[r + c.rs], g.v[k], g.v[k + c.cs]]);
+  }
+  return out;
+}
+/* The table row and column under p (a point inside the grid), when the grid gives the boxes; else null. */
+function gridSlotAt(p) {
+  const fit = gridFit(), g = BX.grid;
+  if (!fit) return null;
+  const at = ax => { const a = gAlong(ax, p), q = gPos(ax, p); let i = 0; while (i < g[ax].length - 2 && gAt(ax, g[ax][i + 1], a) <= q) i++; return i; };
+  const r = at('h') + fit.h, k = at('v') + fit.v;
+  return S.slots[r] && S.slots[r][k] >= 0 ? { r, k } : null;
+}
+/* The merged cell of the table under p (a point inside the grid), or null. */
+function gridMergedAt(p) {
+  const at = gridSlotAt(p), c = at ? S.model.cells[S.slots[at.r][at.k]] : null;
+  return c && (c.rs > 1 || c.cs > 1) ? c : null;
+}
+const rectName = q => (q.r0 === q.r1 && q.c0 === q.c1 ? `${colName(q.c0)}${q.r0 + 1}` : `${colName(q.c0)}${q.r0 + 1}:${colName(q.c1)}${q.r1 + 1}`);
+const cellRect = c => ({ r0: c.r, c0: c.c, r1: c.r + c.rs - 1, c1: c.c + c.cs - 1 });
+/* The cells of the table merged into one rectangle: two cells and what a rectangle around them takes in too. */
+function mergeRect(a, b) {
+  return expandRect({ r0: Math.min(a.r, b.r), c0: Math.min(a.c, b.c), r1: Math.max(a.r + a.rs, b.r + b.rs) - 1, c1: Math.max(a.c + a.cs, b.c + b.cs) - 1 });
+}
+/* Right-click in the grid: merge or split cells of the table there. On a line, between two cells: merge them
+   (the border goes only there); on the dotted part of a line, or inside a merged cell: split it; inside a cell: merge
+   it with the cell above, below, left or right. Only while the grid has the size of the table. */
+function gridCellItems(p, h) {
+  const at = gridSlotAt(p);
+  if (!at || !gridInside(p)) return [];
+  const m = S.model, sl = S.slots, fit = gridFit(), here = m.cells[sl[at.r][at.k]], items = [];
+  const merged = c => c.rs > 1 || c.cs > 1, split = c => [`gcell:split:${c.r}:${c.c}`, `Split ${rectName(cellRect(c))} (merged cell): its lines come back`, ''];
+  const merge = (q, label) => [`gcell:merge:${q.r0}:${q.c0}:${q.r1}:${q.c1}`, label, ''];
+  const last = h ? BX.grid[h.ax].length - 1 : 0;
+  if (h && h.end === null && h.i > 0 && h.i < last) {  // on an inner line: the two cells on both sides of it there
+    const a = h.ax === 'h' ? m.cells[sl[h.i + fit.h - 1][at.k]] : m.cells[sl[at.r][h.i + fit.v - 1]];
+    const b = h.ax === 'h' ? m.cells[sl[h.i + fit.h][at.k]] : m.cells[sl[at.r][h.i + fit.v]];
+    if (a && b && a !== b) { const q = mergeRect(a, b); items.push(merge(q, `Merge across this line: ${rectName(q)} becomes one cell`)); }
+    else if (a && a === b) items.push(split(a));
+    return items;
+  }
+  if (merged(here)) items.push(split(here));
+  const nb = [['above', here.r - 1, here.c], ['below', here.r + here.rs, here.c], ['on the left', here.r, here.c - 1], ['on the right', here.r, here.c + here.cs]];
+  for (const [w, r, k] of nb) {
+    if (r < fit.h || k < fit.v || r >= fit.h + BX.grid.h.length - 1 || k >= fit.v + BX.grid.v.length - 1) continue;
+    const q = mergeRect(here, m.cells[sl[r][k]]);
+    items.push(merge(q, `Merge with the cell ${w}: ${rectName(q)}`));
+  }
+  return items;
+}
+function gridCellOp(op) {
+  if (!BX.grid || BX.gridFresh || !gridFit()) return;
+  const [, what, ...n] = op.split(':'), v = n.map(Number);
+  if (S.editing !== null) stopEditing(true);
+  S.sel = what === 'merge' ? { ar: v[0], ac: v[1], er: v[2], ec: v[3] } : { ar: v[0], ac: v[1], er: v[0], ec: v[1] };
+  const texts = what === 'merge' ? cellsInRect(rectOfSel()).filter(i => S.model.cells[i].text).length : 0;
+  if (!apply(what, OPS[what])) return;
+  gridLive();  // the boxes from the lines: the merged cell, or each part of the split one
+  const c = S.model.cells[activeIndex()];
+  toast(what === 'merge' ? `${rectName(cellRect(c))} is one cell now${texts > 1 ? ' (their texts are joined)' : ''}. Ctrl+Z undoes it.`
+    : `${rectName({ r0: v[0], c0: v[1], r1: v[0], c1: v[1] })}: the merged cell is split, its text stays in the first part. Ctrl+Z undoes it.`, 4000);
 }
 function drawGrid() {
   const svg = $('#overlay');
   $$('.g', svg).forEach(n => n.remove());
-  for (const k of ['snap', 'even', 'apply']) $(`#bx-gridbar [data-g="${k}"]`).disabled = !!BX.gridFresh;
-  $('#bx-gridbar [data-g="undo"]').disabled = !(BX.gUndo || []).length;
-  $('#bx-gridbar [data-g="redo"]').disabled = !(BX.gRedo || []).length;
+  for (const k of ['snap', 'even']) $(`#bx-gridbar [data-g="${k}"]`).disabled = !!BX.gridFresh;
   if (!BX.grid || !IV.w || BX.gridFresh) { renderGridSize(); return; }  // no lines before the outline is drawn
   renderGridSize();
   const g = BX.grid, s = IV.scale, grp = svgEl('g', {}, 'g'), hotKeys = (BX.gridHotKey || '').split('|');
+  const mg = gridMerges(g);
+  for (const c of mg ? mg.cells : []) {  // the merged cells of the table: a light tint over each
+    const [T, B, L, R] = c;
+    grp.appendChild(svgEl('polygon', { points: [crossPt(T, L), crossPt(T, R), crossPt(B, R), crossPt(B, L)].map(q => q.join(',')).join(' ') }, 'gmerge'));
+  }
   for (const ax of ['h', 'v']) g[ax].forEach((_, i) => {
     const [A, B] = visEnds(g, ax, i), last = g[ax].length - 1;
     const gap = Math.min(...[i - 1, i + 1].filter(j => j >= 0 && j <= last).map(j => Math.abs(gAt(ax, g[ax][j], gAlong(ax, A)) - gAt(ax, g[ax][i], gAlong(ax, A)))));
     const rad = clamp(gap * s * 0.3, 2.5, 5.5);  // smaller round ends when the lines are close on screen
-    const cls = 'gl' + (i === 0 || i === last ? ' frame' : '') + (hotKeys.includes(ax + i) ? ' hot' : '');
-    grp.appendChild(svgEl('line', { x1: A[0], y1: A[1], x2: B[0], y2: B[1], 'vector-effect': 'non-scaling-stroke' }, cls));
+    const sel = BX.gSel && BX.gSel.ax === ax && BX.gSel.i === i;
+    const cls = 'gl' + (i === 0 || i === last ? ' frame' : '') + (hotKeys.includes(ax + i) ? ' hot' : hotKeys.includes('n' + ax + i) ? ' near' : hotKeys.includes('x' + ax + i) ? ' del' : '') + (sel ? ' sel' : '');
+    const inm = mg && mg[ax][i];
+    if (!inm || !inm.some(Boolean)) grp.appendChild(svgEl('line', { x1: A[0], y1: A[1], x2: B[0], y2: B[1], 'vector-effect': 'non-scaling-stroke' }, cls));
+    else {  // the parts of the line inside a merged cell are dotted: no border there in the table
+      const pt = j => (ax === 'h' ? crossPt(g.h[i], g.v[j]) : crossPt(g.h[j], g.v[i]));
+      for (let j = 0; j < inm.length;) {
+        let k = j + 1;
+        while (k < inm.length && inm[k] === inm[j]) k++;
+        const P = pt(j), Q = pt(k);
+        grp.appendChild(svgEl('line', { x1: P[0], y1: P[1], x2: Q[0], y2: Q[1], 'vector-effect': 'non-scaling-stroke' }, cls + (inm[j] ? ' inm' : '')));
+        j = k;
+      }
+    }
     for (const P of [A, B]) grp.appendChild(svgEl('circle', { cx: P[0], cy: P[1], r: rad / s, 'vector-effect': 'non-scaling-stroke' }, 'gh' + (hotKeys.includes(ax + i) ? ' hot' : '')));
   });
   const fs = 11 / s, label = (x, y, t, anchor) => {
@@ -2798,14 +3775,86 @@ function drawGrid() {
   }
   svg.appendChild(grp);
 }
-function gridHot(h) {
-  const key = h ? h.ax + h.i + (h.alt ? '|' + h.alt.ax + h.alt.i : '') : null;
+/* Under the pointer: a line (red), or inside the grid the nearest row and column lines (dashed: a drag up or down
+   moves that row line, left or right that column line); the hint under the image says what a drag does. */
+function gridHot(h, p, inside) {
+  let key = null, hint = null;
+  if (h) {
+    key = h.ax + h.i + (h.alt ? '|' + h.alt.ax + h.alt.i : '');
+    const isSel = BX.gSel && h.end === null && h.ax === BX.gSel.ax && h.i === BX.gSel.i;
+    hint = isSel ? null : gridLineHint(h);  // the selected line: the hint of the selection
+  }
+  else if (inside && p) {
+    key = `nh${gridNearest('h', p)}|nv${gridNearest('v', p)}`;
+    hint = 'Drag up or down: moves the nearest row line (dashed) · left or right: the nearest column line · click a line, then the arrow keys move it a little (Shift: more) · Shift+drag: a new outline';
+    const mc = gridMergedAt(p);
+    if (mc) hint = `${cellRef(mc)}:${colName(mc.c + mc.cs - 1)}${mc.r + mc.rs} is one merged cell in the table: the dotted lines are no border there (right-click: split it) · ` + hint;
+  }
   if (key !== BX.gridHotKey) { BX.gridHotKey = key; drawGrid(); }
+  if (hint !== BX.gridHint) { BX.gridHint = hint; renderBoxbar(); }
+}
+function gridLineName(ax, i) {
+  const last = BX.grid[ax].length - 1;
+  return ax === 'h' ? (i === 0 ? 'Top border' : i === last ? 'Bottom border' : `Row line between rows ${i} and ${i + 1}`)
+    : (i === 0 ? 'Left border' : i === last ? 'Right border' : `Column line between ${colName(i - 1)} and ${colName(i)}`);
+}
+function gridLineHint(h) {
+  if (h.end !== null) return 'Round end: drag it to tilt the line (the other end stays) · at a corner, the direction of the drag picks the border';
+  const row = h.ax === 'h', border = h.i === 0 || h.i === BX.grid[h.ax].length - 1;
+  return `${gridLineName(h.ax, h.i)}: drag ${row ? 'up or down' : 'left or right'} to move it${border ? ' (the inner lines follow; Alt+drag: the border alone)' : ''} · click it, then ${row ? '↑ ↓' : '← →'}: a little at a time (Shift: more)${border ? '' : gridFit() ? ' · right-click: remove it, or merge the two cells across it there' : ' · right-click: remove it'}`;
+}
+/* Is p inside the outline of the grid? Which line of axis ax is nearest to p? */
+function gridInside(p) {
+  return ['h', 'v'].every(ax => { const L = BX.grid[ax], a = gAlong(ax, p), q = gPos(ax, p); return q >= gAt(ax, L[0], a) && q <= gAt(ax, L[L.length - 1], a); });
+}
+function gridNearest(ax, p) {
+  const L = BX.grid[ax], a = gAlong(ax, p), q = gPos(ax, p);
+  let best = 0, bd = Infinity;
+  L.forEach((l, i) => { const d = Math.abs(gAt(ax, l, a) - q); if (d < bd) { bd = d; best = i; } });
+  return best;
+}
+/* A drag inside the grid, not on a line: once it has a direction, the nearest line across it moves. */
+function gridNearDrag(d, p) {
+  const dx = (p[0] - d.start[0]) * IV.scale, dy = (p[1] - d.start[1]) * IV.scale;
+  if (Math.abs(dx) + Math.abs(dy) < 4) return;
+  const ax = Math.abs(dy) >= Math.abs(dx) ? 'h' : 'v';
+  d.kind = 'grid'; d.hit = { ax, i: gridNearest(ax, d.start), end: null };
+  BX.gridHotKey = ax + d.hit.i;
+  gridDrag(d, p);
+}
+/* A line clicked or dragged stays selected: the arrow keys across it move it a little (Shift: more); a click on an
+   empty spot unselects it. */
+function gridSelLine(sel) {
+  if (!sel && !BX.gSel) return;
+  BX.gSel = sel; drawGrid(); renderBoxbar();
+}
+function gridNudge(dir, big) {
+  const { ax, i } = BX.gSel, g = BX.grid, L = g[ax];
+  if (!L || !L[i]) return gridSelLine(null);
+  const want = dir * (big ? 10 : 1) / IV.scale;  // screen pixels
+  const ends = visEnds(g, ax, i), par = gridParallel(g, ax, i);
+  let line = L[i];
+  if (par) {  // "moved lines parallel to": it takes the tilt of that border, around its middle
+    const am = (gAlong(ax, ends[0]) + gAlong(ax, ends[1])) / 2, sl = (par[1] - par[0]) / gLen(ax), p0 = gAt(ax, line, am) - sl * am;
+    line = [p0, p0 + sl * gLen(ax)];
+  }
+  let lo = -Infinity, hi = Infinity;
+  for (const E of ends) {
+    const a = gAlong(ax, E), cur = gAt(ax, line, a), [mn, mx] = gLimits(g, ax, i, a);
+    lo = Math.max(lo, mn - cur); hi = Math.min(hi, mx - cur);
+  }
+  if (lo > hi) return;
+  const d = line === L[i] ? clamp(want, Math.min(0, lo), Math.max(0, hi)) : clamp(want, lo, hi);
+  if (!d && line === L[i]) return;
+  const key = ax + i, now = Date.now();  // arrow presses on one line, one after the other: one undo step
+  if (!(BX.nudged && BX.nudged.k === key && now - BX.nudged.t < 1500 && gridTopIsStep())) gridPush();
+  BX.nudged = { k: key, t: now };
+  L[i] = [line[0] + d, line[1] + d]; drawGrid(); gridLive();
 }
 /* The line (or round end of a line) under p. A round end only when the pointer is on it: the ends sit on the
    outer lines, so between two ends the outer line itself is taken. */
 function gridHit(p) {
-  const g = BX.grid, s = IV.scale, tol = 8 / s;
+  const g = BX.grid, s = IV.scale, tol = 10 / s;
   let end = null, line = null;
   const ends = [];
   for (const ax of ['h', 'v']) g[ax].forEach((_, i) => {
@@ -2829,10 +3878,21 @@ function gridDrag(d, p) {
   if (!d.moved) {
     if (dist(p, d.start) * IV.scale < (d.hit.alt ? 4 : 2)) return;
     d.moved = true;
+    d.pick = d.hit.end === null && !d.hit.alt && gridInside(d.start);  // taken by its middle: the direction may pick another
     if (d.hit.alt) {
       const side = Math.abs(p[0] - d.start[0]) > Math.abs(p[1] - d.start[1]), want = side ? 'v' : 'h';
       d.hit = d.hit.ax === want ? { ...d.hit, alt: null } : { ...d.hit.alt, alt: null };
       BX.gridHotKey = null;
+    }
+  }
+  if (d.pick && dist(p, d.start) * IV.scale >= 6) {
+    d.pick = false;
+    const dx = Math.abs(p[0] - d.start[0]), dy = Math.abs(p[1] - d.start[1]);
+    if (d.hit.ax === 'h' ? dx > 2 * dy : dy > 2 * dx) {  // along the line, which cannot move that way: the nearest line
+      BX.grid[d.hit.ax] = d.orig[d.hit.ax].map(l => l.slice());  // across it moves (left / right: a column line)
+      const ax = d.hit.ax === 'h' ? 'v' : 'h';
+      d.hit = { ax, i: gridNearest(ax, d.start), end: null };
+      BX.gridHotKey = ax + d.hit.i;
     }
   }
   const g = BX.grid, o = d.orig, { ax, i, end } = d.hit, line = o[ax][i], last = o[ax].length - 1;
@@ -2841,7 +3901,18 @@ function gridDrag(d, p) {
   const scale = (i === 0 || i === last) && last > 1 && !d.alone;
   const lim = a => !scale ? gLimits(o, ax, i, a)
     : i === 0 ? [0, gAt(ax, o[ax][last], a) - 2 * last] : [gAt(ax, o[ax][0], a) + 2 * last, gSpan(ax)];
-  if (end === null) {  // move the whole line
+  const par = gridParallel(o, ax, i);
+  if (end === null && par) {  // move the whole line, with the tilt of the border chosen in the bar
+    const a0 = gAlong(ax, d.start), s = (par[1] - par[0]) / gLen(ax);
+    let lo = -Infinity, hi = Infinity;  // its position at a0, so that both of its ends stay between the neighbours
+    for (const E of ends) {
+      const a = gAlong(ax, E), [mn, mx] = lim(a);
+      lo = Math.max(lo, mn - s * (a - a0)); hi = Math.min(hi, mx - s * (a - a0));
+    }
+    if (lo > hi) return;
+    const pos = clamp(gAt(ax, line, a0) + delta, lo, hi), p0 = pos - s * a0;
+    g[ax][i] = [p0, p0 + s * gLen(ax)];
+  } else if (end === null) {  // move the whole line
     let lo = -Infinity, hi = Infinity;
     for (const E of ends) {
       const a = gAlong(ax, E), cur = gAt(ax, line, a), [mn, mx] = lim(a);
@@ -2858,6 +3929,12 @@ function gridDrag(d, p) {
   }
   if (scale) scaleInner(g, o, ax);
   drawGrid();
+}
+/* The border whose tilt a moved line takes ("moved lines parallel to" in the grid bar): the top / left one or the
+   bottom / right one; none when that is off, or for that border itself. */
+function gridParallel(g, ax, i) {
+  const v = $('#g-par').value, L = g[ax], j = v === 'start' ? 0 : v === 'end' ? L.length - 1 : -1;
+  return j < 0 || j === i ? null : L[j];
 }
 /* Inner lines of axis ax placed between the (new) outer lines of g as they were between the outer lines of o:
    each keeps its share of the width (or height), so the spacing of the model's grid is kept. */
@@ -2890,7 +3967,7 @@ function gridSnap() {
     }
   }
   drawGrid();
-  toast(`Snapped: ${lines} line${lines !== 1 ? 's' : ''} on drawn lines, ${gaps} in gaps between text. Check them before making the boxes.`, 4000);
+  toast(`Snapped: ${lines} line${lines !== 1 ? 's' : ''} on drawn lines, ${gaps} in gaps between text. The boxes follow; check the lines.`, 4000);
 }
 /* Slope (tan of the angle) of the rows ('h') or columns ('v') of writing and ruling inside the grid outline,
    from the sharpest projection profile; null when the page looks straight. */
@@ -3300,7 +4377,7 @@ $('#boxbar').addEventListener('click', e => {
   const b = e.target.closest('button[data-bx]'); if (!b) return;
   const a = b.dataset.bx;
   if (a === 'regrid') return openGrid('saved');
-  if (a === 'grid') { if (BX.grid) return closeGrid(false); const r = b.getBoundingClientRect(); return gridMenu(r.left, r.bottom + 4); }
+  if (a === 'grid') { if (BX.grid) return closeGrid('keep'); const r = b.getBoundingClientRect(); return gridMenu(r.left, r.bottom + 4); }
   if (a === 'fit') return runOp('box-fit');
   if (a === 'assign') return BX.assign !== null ? endAssign() : startAssign();
   if (a === 'shape') return;
@@ -3325,48 +4402,49 @@ const lineColors = () => Object.assign({}, LINE_COLORS, LS.get('linecolors', {})
 function applyLineColors() {
   const c = lineColors(), root = document.documentElement.style;
   root.setProperty('--boxline', c.box); root.setProperty('--boxact', c.act); root.setProperty('--gridline', c.grid);
-  $('[data-img="colors"]').classList.toggle('on', Object.keys(LINE_COLORS).some(k => c[k] !== LINE_COLORS[k]));
+  displayMark();
 }
-function toggleColors() {
+/* ☀ Display ▾: the brightness and contrast of the image and the colors of the lines, in one panel. */
+const toggleColors = () => toggleDisplay(), toggleAdjust = () => toggleDisplay();
+function displayMark() {
+  const c = lineColors(), [b, k] = LS.get('imgadj', [100, 100]);
+  $('[data-img="adjust"]').classList.toggle('on', b !== 100 || k !== 100 || Object.keys(LINE_COLORS).some(x => c[x] !== LINE_COLORS[x]));
+}
+function toggleDisplay() {
   const pop = $('#imgadj');
-  if (!pop.hidden && pop.dataset.kind === 'colors') { pop.hidden = true; return; }
-  pop.dataset.kind = 'colors';
-  const c = lineColors();
-  const row = (k, label) => `<div class="col-row"><span>${label}</span><input type="color" data-k="${k}" value="${c[k]}" title="Any color"></div>
-    <div class="sw">${SWATCHES.map(v => `<button class="swatch${v === c[k] ? ' on' : ''}" data-k="${k}" data-c="${v}" style="background:${v}" title="${v}"></button>`).join('')}</div>`;
-  pop.innerHTML = `<b>Line colors</b>${row('box', 'Boxes')}${row('act', 'Box of the selected cell')}${row('grid', 'Grid lines')}
-    <div class="gp-row"><button id="col-reset">Reset</button><span class="spacer"></span><button id="col-close" class="primary">OK</button></div>`;
+  if (!pop.hidden) { pop.hidden = true; return; }
+  pop.dataset.kind = 'display';
+  const c = lineColors(), [b, k] = LS.get('imgadj', [100, 100]);
+  const row = (key, label) => `<div class="col-row"><span>${label}</span><input type="color" data-k="${key}" value="${c[key]}" title="Any color"></div>
+    <div class="sw">${SWATCHES.map(v => `<button class="swatch${v === c[key] ? ' on' : ''}" data-k="${key}" data-c="${v}" style="background:${v}" title="${v}"></button>`).join('')}</div>`;
+  pop.innerHTML = `<div class="gp-row"><b>Image</b><span class="spacer"></span><button id="adj-reset" class="small">Reset</button></div>
+    <label>Brightness <input type="range" id="adj-b" min="40" max="200" value="${b}"></label>
+    <label>Contrast <input type="range" id="adj-c" min="50" max="300" value="${k}"></label>
+    <div class="gp-row disp-sep"><b>Line colors</b><span class="spacer"></span><button id="col-reset" class="small">Reset</button></div>
+    ${row('box', 'Boxes')}${row('act', 'Box of the selected cell')}${row('grid', 'Grid lines')}
+    <div class="gp-row" title="Tap it: the lines and boxes hide, tap again: they come back. Hold it: hidden only while you hold it">Key to hide them: <b>${esc(keyNames('hide') || 'none')}</b><span class="spacer"></span><button id="col-key">⌨ Keys…</button></div>
+    <div class="gp-row"><span class="spacer"></span><button id="col-close" class="primary">OK</button></div>`;
   pop.hidden = false;
-  const set = (k, v) => {
-    LS.set('linecolors', Object.assign(lineColors(), { [k]: v })); applyLineColors();
-    pop.querySelectorAll(`.swatch[data-k="${k}"]`).forEach(b => b.classList.toggle('on', b.dataset.c === v));
-    pop.querySelector(`input[data-k="${k}"]`).value = v;
+  const upd = () => { LS.set('imgadj', [+$('#adj-b').value, +$('#adj-c').value]); applyAdjust(); };
+  $('#adj-b').oninput = upd; $('#adj-c').oninput = upd;
+  $('#adj-reset').onclick = () => { $('#adj-b').value = 100; $('#adj-c').value = 100; upd(); };
+  const set = (key, v) => {
+    LS.set('linecolors', Object.assign(lineColors(), { [key]: v })); applyLineColors();
+    pop.querySelectorAll(`.swatch[data-k="${key}"]`).forEach(x => x.classList.toggle('on', x.dataset.c === v));
+    pop.querySelector(`input[data-k="${key}"]`).value = v;
   };
-  pop.onclick = e => { const b = e.target.closest('.swatch'); if (b) set(b.dataset.k, b.dataset.c); };
+  pop.onclick = e => { const s = e.target.closest('.swatch'); if (s) set(s.dataset.k, s.dataset.c); };
   pop.querySelectorAll('input[type=color]').forEach(i => { i.oninput = () => set(i.dataset.k, i.value); });
-  $('#col-reset').onclick = () => { for (const k in LINE_COLORS) set(k, LINE_COLORS[k]); };
+  $('#col-reset').onclick = () => { for (const key in LINE_COLORS) set(key, LINE_COLORS[key]); };
   $('#col-close').onclick = () => { pop.hidden = true; $('#gridwrap').focus({ preventScroll: true }); };
+  $('#col-key').onclick = () => { pop.hidden = true; openKeys('hide'); };
 }
 
 // Brightness / contrast of the image (display only)
 function applyAdjust() {
   const [b, c] = LS.get('imgadj', [100, 100]);
   $('#img').style.filter = b === 100 && c === 100 ? '' : `brightness(${b}%) contrast(${c}%)`;
-  $('[data-img="adjust"]').classList.toggle('on', b !== 100 || c !== 100);
-}
-function toggleAdjust() {
-  const pop = $('#imgadj');
-  if (!pop.hidden && pop.dataset.kind !== 'colors') { pop.hidden = true; return; }
-  pop.dataset.kind = 'adjust'; pop.onclick = null;
-  const [b, c] = LS.get('imgadj', [100, 100]);
-  pop.innerHTML = `<label>Brightness <input type="range" id="adj-b" min="40" max="200" value="${b}"></label>
-    <label>Contrast <input type="range" id="adj-c" min="50" max="300" value="${c}"></label>
-    <div class="gp-row"><button id="adj-reset">Reset</button><span class="spacer"></span><button id="adj-close" class="primary">OK</button></div>`;
-  pop.hidden = false;
-  const upd = () => { LS.set('imgadj', [+$('#adj-b').value, +$('#adj-c').value]); applyAdjust(); };
-  $('#adj-b').oninput = upd; $('#adj-c').oninput = upd;
-  $('#adj-reset').onclick = () => { $('#adj-b').value = 100; $('#adj-c').value = 100; upd(); };
-  $('#adj-close').onclick = () => { pop.hidden = true; $('#gridwrap').focus({ preventScroll: true }); };
+  displayMark();
 }
 
 // Layout: image beside or above the table, resizable
@@ -3413,7 +4491,8 @@ function doneWarnings() {
   const pol = boxPolicy();
   if (pol === 'text' || pol === 'all') {
     const miss = m.cells.filter(c => needsBox(c) && !c.bbox);
-    if (miss.length) out.push(`${miss.length} cell${miss.length > 1 ? 's' : ''} without a box: ${short(miss.map(cellRef))} (Ctrl+E shows the boxes)`);
+    if (miss.length && !m.cells.some(c => c.bbox)) out.push(`No cell has a box yet (${miss.length} cells without a box): box mode, then ▦ Grid ▾, gives them all at once`);
+    else if (miss.length) out.push(`${miss.length} cell${miss.length > 1 ? 's' : ''} without a box: ${short(miss.map(cellRef))}`);
   }
   return out;
 }
@@ -3421,9 +4500,12 @@ async function markDone(force) {
   if (!force) {
     const warn = doneWarnings();
     if (warn.length) {
+      const pol = boxPolicy(), miss = pol === 'text' || pol === 'all' ? S.model.cells.filter(c => needsBox(c) && !c.bbox) : [];
+      const none = miss.length && !S.model.cells.some(c => c.bbox);
       openModal(`<h2>Mark as done?</h2><p>Please check, it may be right:</p><ul>${warn.map(w => `<li>${esc(w)}</li>`).join('')}</ul>
-        <div class="actions"><button data-close>Go back</button><button class="primary" id="done-ok">Done anyway</button></div>`);
+        <div class="actions">${miss.length ? `<button id="done-box" title="${none ? 'Box mode, to give the cells their boxes (▦ Grid ▾: all at once)' : 'Box mode, on the first cell without a box'}">${none ? '▭ Go to box mode' : `▭ Show the first (${esc(cellRef(miss[0]))})`}</button><span class="spacer"></span>` : ''}<button data-close>Go back</button><button class="primary" id="done-ok">Done anyway</button></div>`);
       $('#done-ok').onclick = () => { closeModal(); markDone(true); };
+      if (miss.length) $('#done-box').onclick = () => { closeModal(); if (!BX.on) setBoxMode(true); if (!none) setSel(miss[0].r, miss[0].c); $('#gridwrap').focus({ preventScroll: true }); };
       return;
     }
   }
@@ -4205,6 +5287,7 @@ function cmpOpen(src, mode) {
   if (mode === 'boxes' && !boxed) mode = 'text';
   CMP = { src, mode, selT: new Set(), diffs: [], their: new Map(), mine: new Map(), theirTo: new Map() };
   $('#cmp').hidden = false;
+  cmpSize();
   $('#cmp-name').textContent = src.name;
   $('#cmp-name').title = src.notes.length ? 'Notes: ' + src.notes.join(' · ') : '';
   $('#cmp-mode button[data-cm="boxes"]').disabled = !boxed;
@@ -4219,6 +5302,22 @@ function cmpClose() {
   $('#gridwrap').focus({ preventScroll: true });
 }
 $('#cmp-close').addEventListener('click', cmpClose);
+// The width of the comparison: drag its left border (kept in this browser); double-click: half and half.
+function cmpSize() { const p = LS.get('cmpsize', 0); $('#cmp').style.flex = p ? `0 0 ${p}%` : ''; }
+(() => {
+  const grip = $('#cmp-grip');
+  let drag = false;
+  grip.addEventListener('pointerdown', e => { if (e.button) return; e.preventDefault(); drag = true; grip.classList.add('drag'); grip.setPointerCapture(e.pointerId); });
+  grip.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const r = $('#gridrow').getBoundingClientRect();
+    LS.set('cmpsize', Math.round(clamp((r.right - e.clientX) / r.width * 100, 15, 85) * 10) / 10);
+    cmpSize();
+  });
+  const end = () => { if (!drag) return; drag = false; grip.classList.remove('drag'); };
+  grip.addEventListener('pointerup', end); grip.addEventListener('pointercancel', end);
+  grip.addEventListener('dblclick', () => { LS.set('cmpsize', 0); cmpSize(); });
+})();
 $$('#cmp-mode button').forEach(b => b.addEventListener('click', () => {
   if (!CMP || b.disabled) return;
   CMP.mode = b.dataset.cm; CMP.selT = new Set(); LS.set('cmpmode', CMP.mode); cmpRefresh();
@@ -4613,6 +5712,7 @@ function helpSections() {
       ['Ctrl+Enter', 'This table is done: open the next one'],
       ...(boxes ? [['Ctrl+E', 'Box mode: draw or fix the box of each cell on the image']] : []),
       ['Ctrl+/ | [?]', 'Open or close this help'],
+      ['[⌨]', 'Keys: choose your own key for each action', 'Change or remove the key of an action; a key that another action has can be taken (that action is then left without it). Copy, paste, undo and moving in the table stay as they are.'],
     ] },
     { id: 'move', title: 'Move and select', items: [
       ['↑↓←→', 'Move'],
@@ -4648,7 +5748,9 @@ function helpSections() {
       ['Ctrl+− then L/U | [Cells ✕]', 'Delete the selected cells: {L} the cells on the right move left, {U} the cells below move up', 'The boxes stay where they are on the image, unless you tick “the boxes move with their text”. A merged cell only partly selected must be split first.'],
       ['Ctrl+B', 'Header cell on / off'],
       ['Ctrl+U', 'Unclear reading on / off'],
-      ['[New table…]', 'Start again from an empty grid of the size you choose', 'The boxes (yours or a model’s) can be kept: they are put on the new grid by their place, from A1. Off by some rows or columns: click a box, [Move to cell…], “all the boxes”.'],
+      ['Ctrl+Shift+F', 'Replace a text in the selected cells, or in the whole table', 'E.g. a letter the model always reads wrong (8A for 8Λ), only in one column: select the column, then {Ctrl+Shift+F}. “Only cells that are exactly this text” leaves longer texts alone. One step: {Ctrl+Z} undoes it. Also in the right-click menu.'],
+      ['Ctrl+V', 'One value pasted on several selected cells fills every one of them', 'E.g. a ditto mark " in a whole column: copy one, select the cells, paste.'],
+      ['[Import ▾] then [New empty table…]', 'Start again from an empty grid of the size you choose', 'The boxes (yours or a model’s) can be kept: they are put on the new grid by their place, from A1. Off by some rows or columns: click a box, [Move to cell…], “all the boxes”.'],
       ['right-click', 'All of the above, in a menu'],
     ] },
     { id: 'table', title: 'Table and import', items: [
@@ -4659,7 +5761,7 @@ function helpSections() {
       ['[Note]', 'Write a note on this table, or flag it for discussion'],
       ['[Skip…]', 'Skip this table (not a table, unreadable…), with a reason'],
       ['[Import ▾]', 'Take the text, the structure or the boxes of another source: a model of the batch, or a file', 'Only the text, the structure and text, only the structure (your text goes into its cells) or only the boxes. You first see the image, your table and the table after the import: take all the changes or click the ones to leave out. Drag over several, then {Enter}: if any is taken, all are left out; if none, all are taken. Files: annotation JSON, HTML table, PAGE XML, CSV / TSV.'],
-      ['[Compare ▾]', 'Another source next to your table while you edit', 'Its text, structure or boxes. The cells that differ are coloured on the right and marked in your table; it follows the cell you are on and your edits. Take a difference: click it (or drag over several), then {Enter}, [Take ←] or double-click.'],
+      ['[Compare ▾]', 'Another source next to your table while you edit', 'Its text, structure or boxes. The cells that differ are coloured on the right and marked in your table; it follows the cell you are on and your edits. Take a difference: click it (or drag over several), then {Enter}, [Take ←] or double-click. Drag its left border to make it wider or narrower; double-click the border: half and half.'],
     ] },
     { id: 'image', title: 'Image', items: [
       ['wheel', 'Scroll'],
@@ -4667,7 +5769,7 @@ function helpSections() {
       ['drag', 'Move the image'],
       ['click', 'Pin the red row guide (click again to remove it)'],
       ['[Fit] | [Width]', 'The whole image / as wide as the pane'],
-      ['[☀]', 'Brightness and contrast'],
+      ['[☀ Display ▾]', 'Brightness and contrast of the image, colours of the boxes and grid lines'],
       ['[⇆ Layout]', 'Image beside or above the table'],
     ] },
   ];
@@ -4684,13 +5786,24 @@ function helpSections() {
     ['[names]', 'Write the cell name in each box, to check them'],
     ['right-click a box', 'Merge, move to another cell, fit, remove; a new row or column with boxes of the same size'],
     ['Space+drag | middle button', 'Move the image'],
+    ['Ctrl+H', 'Hide the boxes and grid lines, to see the page under them', 'Tap it: hidden until you tap it again (or tick “Show boxes” / “Show lines” above the image). Hold it: hidden only while you hold it. Also in View. Another key: [⌨] (or right-click “Show boxes”).'],
     ['Delete', 'Remove the box of the selected cells'],
     ['Esc', 'Cancel the box being drawn'],
-    ['[Grid]', 'Give every cell its box at once, from lines on the row and column borders', 'Start from the cell boxes (model output) or from a uniform grid you move by hand. The rows × columns fields set its size; another size than the table: Make boxes resizes the table, after asking. Drag the outer border: the inner lines follow; with {Alt}, alone. Drag a round end to tilt a line. {Ctrl+Z} undoes Snap, Even and line moves while the grid is open.'],
-    ['[▦ Back to grid]', 'After Make boxes: open the grid again with the same lines', 'Move them and Make boxes again (boxes fixed by hand are kept with “keep my boxes”). {Ctrl+Z} right after Make boxes does the same.'],
+    ['[Grid]', 'Give every cell its box at once, from lines on the row and column borders', 'Start from the boxes the cells have (the model’s or drawn by hand) or from a uniform grid you move by hand. The boxes follow the lines as you move them and are saved: no button to press. [Close grid], {Enter} or {Esc} closes it; [Cancel] puts the boxes back as they were. Drag the outer border: the inner lines follow; with {Alt}, alone. Drag a round end to tilt a line. While the grid is open, {Ctrl+Z} undoes the last change, of the lines or of the table.'],
+    ['drag in the grid', 'Moves the nearest line: up or down the nearest row line, left or right the nearest column line', 'No need to hit the line: the lines that would move are shown dashed, the hint under the image says what a drag does. Shift+drag draws a new outline.'],
+    ['tint and dotted lines in the grid', 'A merged cell of the table', 'The parts of the lines inside a merged cell are dotted: no border there in the table. The hint under the image names the merged cell under the pointer. Shown while the grid has the size of the table.'],
+    ['right-click in the grid: merge or split', 'Merge two cells across a line, split a merged cell, or merge a cell with the one above, below, left or right', 'On a line between two cells: Merge across this line (only there; Remove this line joins the whole rows). On a dotted part or inside a merged cell: Split, the text stays in the first part. The boxes follow the lines; {Ctrl+Z} undoes it. Only while the grid has the size of the table.'],
+    ['click a line, then ↑↓ or ←→', 'Move that line a little at a time ({Shift}: more)', 'The line stays selected (thick red) until a click on an empty spot. A line you drag is selected too, so the arrows fine-tune it. Ctrl+Z undoes a run of presses in one go.'],
+    ['moved lines parallel to (grid bar, Options ▾)', 'A line you drag by its middle takes the tilt of a border', 'Row lines that of the top or the bottom border, column lines that of the left or the right border. “—”: a line keeps its own tilt. Dragging a round end still tilts it freely. Remembered.'],
+    ['right-click on the image (grid open)', 'Add a row or column line there, or remove the line under the pointer', 'The other lines stay where they are. Outside the grid: a new border. When the grid has the size of the table, the table gets the new row or column too (empty).'],
+    ['grid with fewer rows or columns than the table', 'Choose in the grid bar: keep the table, or make the table match', '[Keep the table]: the rows (columns) the grid has get their boxes from the lines, at the side chosen in "rows at" / "columns at"; the others get no box for now (Done lists them). [Make the table match…]: pick the rows (columns) of the table to delete, or to merge into the one before (their text joins it). A grid with more rows or columns: the boxes wait, and Close grid adds them to the table (empty).'],
+    ['✕ Remove lines (grid bar)', 'Then click a line: it goes, the other lines stay', 'A border too: the next line becomes the border. When the grid has the size of the table, an empty row or column of the table goes with it; one with text stays (the boxes wait until the sizes match). Or click a line, then {Delete}. Esc: done.'],
+    ['rows × columns (grid bar)', 'Another number of rows or columns', 'Rows are added or removed at the bottom and on the right ([Options ▾] of the grid bar: top or left instead): a new row goes outside the grid, as high as the row there; your other lines stay. With “Move all lines” (Options ▾), all the lines are spread evenly again. When the grid had the size of the table, the table gets the same rows or columns (empty) at the same side, so the boxes keep following. Otherwise the boxes wait until the sizes match; [Close grid] resizes the table at those sides, after asking.'],
+    ['[▦ Back to grid]', 'After the grid: open it again with the same lines', 'Move them: the boxes follow (the boxes you drew or fixed by hand stay with “Keep the boxes I drew or fixed by hand”). {Ctrl+Z} right after closing the grid does the same.'],
+    ['Keep the boxes I drew or fixed by hand (grid bar, Options ▾)', 'Whether the lines also replace the boxes you made by hand', 'Ticked: a box you drew (▭ Box, ⬠ Polygon), moved or resized stays as it is when the lines move; the bar above the image says “box ✓” for it. The other cells get their box from the lines. Unticked: the lines give every cell its box, yours too. It is ticked by itself when the grid opens on a table with such boxes (the Options button is then blue); the panel says how many there are.'],
     ['[Fit to ink]', 'Shrink the box to the writing inside it', 'Ruled lines are ignored; it never grows a box.'],
     ['[More ▾]', 'Take the boxes of a model, or remove all boxes'],
-    ['[🎨]', 'The colours of the boxes, of the selected box and of the grid lines'],
+    ['[☀ Display ▾]', 'The colours of the boxes, of the selected box and of the grid lines (and the brightness of the image)'],
   ] });
   secs.push({ id: 'marks', title: 'Marks and colours', note: 'What the colours and corners on the cells of your table mean.', items: [
     [hpCell('act', 'B3') + hpCell('sel'), 'Blue outline: the cell you are on; light blue: the other selected cells'],
@@ -4699,7 +5812,7 @@ function helpSections() {
     [hpCell('h', 'Ages'), 'Grey and bold: header cell, {Ctrl+B}'],
     [hpCell('pad'), 'Striped: an empty cell added to fill a short row of the source', 'Check that this row really has a cell there.'],
     [hpCell('q', '"'), 'Purple ": a ditto mark'],
-    ...(boxes ? [[hpCell('nb', '12'), 'Orange corner, top right, in box mode: this cell still needs its box']] : []),
+    ...(boxes ? [[hpCell('nb', '12'), 'Blue corner, bottom right, in box mode: this cell still needs its box']] : []),
     [hpCell('cmp-d', '12'), 'Orange corner, top right, with [Compare ▾] open: differs from the source you compare with'],
     [hpCell('cmp-s', '12'), 'Purple corner: the structure differs there'],
     [hpCell('cmp-lost', '12'), 'Red corner: your text has no place in their table'],
@@ -4761,7 +5874,8 @@ function helpToggle(tab) { if ($('#help').hidden) helpOpen(tab); else helpClose(
 function renderHelp() {
   const p = $('#help');
   if (p.hidden) return;
-  const secs = helpSections(), words = HP.q.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const kt = s => ({ ...s, note: keyText(s.note), html: keyText(s.html), text: keyText(s.text), items: s.items && s.items.map(it => it.map(keyText)) });
+  const secs = helpSections().map(kt), words = HP.q.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (!secs.some(s => s.id === HP.tab)) HP.tab = 'start';
   const hit = it => words.every(w => hpPlain(it).includes(w));
   const textHits = s => {  // the lines (list items, paragraphs) of a text tab that hold every word
@@ -4833,7 +5947,7 @@ $('#help').addEventListener('keydown', e => {
   if (e.key === 'Escape' && e.target.id === 'hp-find' && e.target.value) {  // Esc first clears the search
     e.preventDefault(); e.stopPropagation(); e.target.value = ''; HP.q = ''; renderHelp(); return;
   }
-  if (e.key === 'Escape' || ((e.ctrlKey || e.metaKey) && e.key === '/')) { e.preventDefault(); e.stopPropagation(); helpClose(); }
+  if (e.key === 'Escape' || keyAction(e) === 'help') { e.preventDefault(); e.stopPropagation(); helpClose(); }
 });
 $('#help').addEventListener('mousedown', e => {
   const h = e.target.closest('.hp-h');
@@ -4875,6 +5989,8 @@ function quickStart() {
     <tr><td>right-click</td><td>insert or delete rows and columns, header, unclear</td></tr>
     <tr><td><kbd>Ctrl+Z</kbd></td><td>undo anything</td></tr>
     <tr><td><kbd>Ctrl+Enter</kbd></td><td>table done, open the next one</td></tr>
+    <tr><td><b>Import ▾</b> (top bar)</td><td>another model did better? Take its text, its structure or its boxes (you see the changes first)</td></tr>
+    <tr><td><b>Compare ▾</b> (top bar)</td><td>another model next to your table while you edit; take its cells one by one</td></tr>
     ${boxPolicy() === 'off' ? '' : '<tr><td><kbd>Ctrl+E</kbd></td><td>box mode: draw or fix the box of each cell on the image</td></tr>'}
     </table></div>
     <p>Your work is saved by itself as you go. On the image: <kbd>Ctrl</kbd>+wheel zooms, click pins a red line to follow a row. All the keys, what the colours mean: <kbd>Ctrl+/</kbd> or the <b>?</b> button (it stays open beside your work).</p>
@@ -4908,7 +6024,7 @@ function openModal(html, opts = {}) {
   modalOpts = opts;
   const m = $('#modal');
   m.className = opts.cls || (opts.wide ? 'wide' : '');
-  m.innerHTML = html;
+  m.innerHTML = keyText(html);
   $('#modal-back').hidden = false;
   $$('[data-close]', m).forEach(b => { b.onclick = () => closeModal(); });
   const first = $('input, textarea, button.primary', m);
@@ -4927,6 +6043,7 @@ $('#modal-back').addEventListener('mousedown', e => { if (e.target.id === 'modal
 let toastTimer = null;
 function toast(html, ms = 2600, raw = false) {
   const t = $('#toast');
+  html = keyText(html);
   t.innerHTML = raw ? html : esc(html);
   t.hidden = false;
   clearTimeout(toastTimer); toastTimer = setTimeout(hideToast, ms);
@@ -4954,6 +6071,7 @@ window.addEventListener('hashchange', () => {
 (async function init() {
   document.documentElement.style.setProperty('--cell-font', LS.get('font', 14) + 'px');
   $('#guide-on').checked = LS.get('guide', true);
+  $('#boxes-on').checked = LS.get('viewboxes', true); migrateHideKey(); applyBoxVis(); applyKeyTitles();
   fetch('static/tips.md').then(r => r.ok ? r.text() : '').then(t => { S.tips = t; renderHelp(); }).catch(() => {});
   try { S.batch = await api('/api/batch'); }
   catch (e) { document.body.innerHTML = '<p style="padding:30px">Cannot reach the annotation server. Is the black window (annotate.py) still open?</p>'; return; }

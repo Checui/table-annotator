@@ -59,6 +59,8 @@
     <button id="btn-note" class="ghost" title="Note / flag this table for discussion">Note</button>
     <button id="btn-skip" class="ghost" title="Not a table, unreadable…">Skip…</button>
     <button id="btn-done" class="primary" title="Mark as done and open the next table">Done ✓ <kbd>Ctrl+Enter</kbd></button>
+    <button data-op="keys" class="ghost icon" title="⌨ Keys: choose your own key for each action">⌨</button>
+    <button data-op="help" class="ghost icon" title="Help: keys and colours (Ctrl+/)">?</button>
     <button id="who-edit" class="chip" title="Annotator"></button>
   </header>
   <div id="banner" hidden></div>
@@ -74,10 +76,10 @@
         <button data-img="in" class="icon" title="Zoom in (Ctrl + wheel)">+</button>
         <span class="sep"></span>
         <label class="toggle view-only" title="A line under the mouse to follow rows. Click the image to pin it, click again to unpin."><input type="checkbox" id="guide-on" checked> Row guide</label>
-        <button data-img="adjust" class="icon" title="Brightness and contrast">☀</button>
-        <button data-img="colors" class="icon" title="Colors of the box and grid lines">🎨</button>
+        <label class="toggle view-only" id="boxes-lbl" title="The cell boxes on the image. Untick to see the page alone"><input type="checkbox" id="boxes-on" checked> Show boxes</label><label class="toggle box-only" id="marks-lbl" title="Untick to see the page under the boxes and grid lines"><input type="checkbox" id="marks-on" checked> <span id="marks-name">Show boxes</span></label>
+        <button data-img="adjust" title="Display: brightness and contrast of the image, colors of the boxes and grid lines">☀<span class="lbl"> Display</span> ▾</button>
         <span class="spacer"></span>
-        <button id="btn-layout" title="Image beside or above the table">⇆ Layout</button>
+        <button id="btn-layout" title="Layout: the image beside or above the table">⇆<span class="lbl"> Layout</span></button>
       </div>
       <div id="boxbar" hidden>
         <div class="pane-tools bx-row" id="bx-normal">
@@ -87,7 +89,7 @@
           <label class="toggle" title="Magnet: the sides of a box you draw, move or resize stick to the boxes next to it, and polygon points to their corners and edges, so boxes touch without a gap. A shared side then moves for both boxes (Alt: alone)"><input type="checkbox" id="bx-snap"> magnet</label>
           <label class="toggle" title="Write the cell name (E5…) in each box, to check which cell each box belongs to"><input type="checkbox" id="bx-names"> names</label>
           <span class="spacer"></span>
-          <button data-bx="grid" title="Put a line on every row and column border; every cell gets the box between its lines. Choose how it starts: from the cell boxes or a uniform grid">▦ Grid ▾</button><button data-bx="regrid" id="bx-regrid" hidden title="Open the grid again with the lines these boxes were made from; move them, then Make boxes (boxes fixed by hand are kept)">▦ Back to grid</button>
+          <button data-bx="grid" title="Put a line on every row and column border; every cell gets the box between its lines. Choose how it starts: from the cell boxes or a uniform grid">▦ Grid ▾</button><button data-bx="regrid" id="bx-regrid" hidden title="Open the grid again with the lines these boxes were made from; move them and the boxes follow (boxes fixed by hand are kept)">▦ Back to grid</button>
           <button data-bx="fit" title="Shrink the box of the selected cells to the writing inside">Fit to ink</button>
           <button data-bx="merge" title="Merge the selected cells: their boxes become one (Ctrl+M). Shift+click boxes on the image to select them">Merge</button>
           <button data-bx="assign" title="Give the box of the selected cell to another cell: click this, then the cell in the table">Move to cell…</button>
@@ -96,16 +98,15 @@
           <span id="bx-count"></span>
         </div>
         <div class="pane-tools bx-row" id="bx-gridbar" hidden>
-          <b>▦ Grid</b><span id="g-size" title="Rows × columns of the grid. Another size than the table: Make boxes resizes the table"><input id="g-rows" type="number" min="1" max="300" aria-label="Rows"> × <input id="g-cols" type="number" min="1" max="300" aria-label="Columns"></span><span id="g-tbl" class="muted"></span>
+          <b>▦ Grid</b><span id="g-size" title="Rows × columns of the grid. Rows and columns are added or removed at the side chosen next to it; with &quot;move all lines&quot;, all the lines are spread evenly again. When the grid had the size of the table, the table gets the same rows or columns (empty)"><input id="g-rows" type="number" min="1" max="300" aria-label="Rows"> × <input id="g-cols" type="number" min="1" max="300" aria-label="Columns"></span><span id="g-tbl" class="muted"></span>
           <button data-g="start" title="Start the lines over: from the cell boxes, or a uniform grid (Ctrl+Z goes back)">Start over ▾</button>
           <button data-g="snap" title="Put each line on the nearest line drawn on the page, or in the middle of the nearest gap between rows of text">Snap</button>
           <button data-g="even" title="Space the inner lines evenly between the outer ones">Even</button>
-          <button data-g="undo" class="icon" title="Undo the last change of the lines (Ctrl+Z)">↶</button>
-          <button data-g="redo" class="icon" title="Redo (Ctrl+Y)">↷</button>
-          <label class="toggle" title="Boxes you drew or fixed by hand stay as they are; all the other cells get their box from the lines"><input type="checkbox" id="g-keep"> keep my boxes</label>
+          <button data-g="deltool" id="g-deltool" title="Remove lines: then click a line, it goes and the other lines stay where they are (a border too: the next line becomes the border). Esc or this button again: done. Or click a line, then Delete">✕ Remove lines</button>
+          <button data-g="opts" id="g-optbtn" title="Settings of the grid: where rows and columns are added or removed, the tilt of moved lines, the boxes you fixed by hand (the button is blue when one is not the usual one)">Options ▾</button>
           <span class="spacer"></span>
-          <button data-g="cancel" title="Close the grid (Esc)">Cancel</button>
-          <button data-g="apply" class="primary" title="Every cell gets the box between its lines (Enter)">Make boxes</button>
+          <button data-g="cancel" title="Close the grid and put the boxes back as they were when it was opened (Ctrl+Y brings the boxes of the lines back)">Cancel</button>
+          <button data-g="apply" class="primary" title="Close the grid (Enter or Esc). The boxes already follow the lines and are saved">Close grid</button>
         </div>
       </div>
       <div id="imgview">
@@ -114,6 +115,16 @@
           <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
         </div>
         <div id="imgadj" class="img-float" hidden></div>
+        <div id="g-opts" class="img-float" hidden>
+          <b>Grid options</b>
+          <label class="g-side" title="Where rows are added or removed: a new row goes outside the grid, as high as the row there (when the image has no room, that row is split in two). The table gets or loses its rows at the same side">Rows added or removed at the <select id="g-side-h"><option value="end">bottom</option><option value="start">top</option></select></label>
+          <label class="g-side" title="Where columns are added or removed: a new column goes outside the grid, as wide as the column there (when the image has no room, that column is split in two). The table gets or loses its columns at the same side">Columns added or removed at the <select id="g-side-v"><option value="end">right</option><option value="start">left</option></select></label>
+          <label class="toggle" title="On: a new number of rows or columns spreads all the lines evenly between the outer ones. Off: your lines stay where they are, and rows or columns are added or removed at the side chosen above"><input type="checkbox" id="g-moveall"> Move all lines when the number of rows or columns changes</label>
+          <label class="g-side" id="g-par-lbl" title="A line you move (by its middle) takes the tilt of a border of the table: a row line that of the top or the bottom border, a column line that of the left or the right border. Off: it keeps its own tilt. Dragging a round end still tilts it freely">Moved lines parallel to <select id="g-par"><option value="">— (their own tilt)</option><option value="start">top · left border</option><option value="end">bottom · right border</option></select></label>
+          <label class="toggle" title="Ticked: the boxes you drew, moved or resized by hand stay as they are when the lines move; the other cells get their box from the lines. Unticked: the lines give every cell its box"><input type="checkbox" id="g-keep"> Keep the boxes I drew or fixed by hand</label>
+          <p id="g-keep-note" class="g-note"></p>
+          <div class="gp-row"><span class="spacer"></span><button id="g-opts-ok" class="primary">OK</button></div>
+        </div>
         <div id="bx-move" class="img-float" hidden></div>
         <div id="box-label" hidden></div>
         <div id="img-hint">Wheel: scroll · Ctrl+wheel: zoom · drag: move · click: pin row guide</div>
@@ -131,19 +142,16 @@
         <span class="group-label">Row</span>
         <button data-op="row-above" title="Insert a row above (Ctrl+Shift+↑)">+↑</button>
         <button data-op="row-below" title="Insert a row below (Ctrl+Shift+↓)">+↓</button>
-        <button data-op="del-rows" title="Delete the selected rows (Ctrl+−, then R)">✕</button>
+        <button data-op="del-rows" class="del" title="Delete the selected rows (Ctrl+−, then R)">✕<small>row</small></button>
         <span class="group-label">Col</span>
         <button data-op="col-left" title="Insert a column to the left (Ctrl+Shift+←)">+←</button>
         <button data-op="col-right" title="Insert a column to the right (Ctrl+Shift+→)">+→</button>
-        <button data-op="del-cols" title="Delete the selected columns (Ctrl+−, then C)">✕</button>
+        <button data-op="del-cols" class="del" title="Delete the selected columns (Ctrl+−, then C)">✕<small>col</small></button>
         <span class="group-label">Cells</span>
-        <button data-op="del-cells" title="Delete the selected cells: the cells on the right move left, or the cells below move up (Ctrl+−, then L or U)">✕</button>
+        <button data-op="del-cells" class="del" title="Delete the selected cells: the cells on the right move left, or the cells below move up (Ctrl+−, then L or U)">✕<small>cells</small></button>
         <span class="sep"></span>
         <button data-op="header" title="Mark / unmark as header cell (Ctrl+B)">Header</button>
         <button data-op="unclear" title="Mark / unmark as unclear reading (Ctrl+U)">Unclear</button>
-        <span class="spacer"></span>
-        <button data-op="new-table" title="Remove the whole annotation and start from an empty grid of the size you choose; the boxes can be kept and put on it by their place">New table…</button>
-        <button data-op="help" class="icon" title="Help: keys and colours (Ctrl+/)">?</button>
       </div>
       <div id="cellbar">
         <span id="cell-ref"></span>
@@ -158,6 +166,7 @@
           <input id="cell-input" type="text" spellcheck="false" autocomplete="off" hidden>
         </div>
         <div id="cmp" hidden>
+          <div id="cmp-grip" title="Drag to make the comparison wider or narrower (double-click: half and half)"></div>
           <div class="pane-tools">
             <b>Compare</b><span id="cmp-name"></span>
             <span class="seg" id="cmp-mode"><button data-cm="text" title="Their text against yours">Text</button><button data-cm="structure" title="Their rows, columns and merges against yours">Structure</button><button data-cm="boxes">Boxes</button></span>
